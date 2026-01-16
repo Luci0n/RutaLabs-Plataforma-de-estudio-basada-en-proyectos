@@ -1,23 +1,64 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 
+type ProjectRole = "owner" | "editor" | "guest";
+
+type ProjectVisibility = "private" | "unlisted" | "public" | string;
+
 type ProjectHit = {
   id: string;
   title: string;
-  visibility: "private" | "unlisted" | "public" | string;
+  visibility: ProjectVisibility;
   is_hidden: boolean;
   updated_at: string;
-  role?: "owner" | "editor" | "guest";
+  role?: ProjectRole;
+};
+
+type OwnedRow = {
+  id: string;
+  title: string;
+  visibility: ProjectVisibility | null;
+  is_hidden: boolean | null;
+  updated_at: string;
+};
+
+type MembershipRow = {
+  project_id: string;
+  role: ProjectRole | null;
+};
+
+type ProjectRowLite = {
+  id: string;
+  title: string;
+  visibility: ProjectVisibility | null;
+  is_hidden: boolean | null;
+  updated_at: string;
+};
+
+type CommunityProjectRow = {
+  id: string;
+  title: string;
+  visibility: ProjectVisibility | null;
+  is_hidden: boolean | null;
+  updated_at: string;
 };
 
 function normQ(q: string | null): string {
   return String(q ?? "").trim().slice(0, 120);
 }
 
+function safeLike(raw: string): string {
+  return raw.replace(/[,()*]/g, " ").trim();
+}
+
+function isProjectRole(v: unknown): v is ProjectRole {
+  return v === "owner" || v === "editor" || v === "guest";
+}
+
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
-    const q = normQ(url.searchParams.get("q"));
+    const q = safeLike(normQ(url.searchParams.get("q")));
 
     if (!q || q.length < 2) {
       return NextResponse.json({ my: [], community: [] });
@@ -31,40 +72,43 @@ export async function GET(req: Request) {
     }
 
     const userId = userRes.user.id;
-    const needle = `%${q}%`;
 
-    // Mis proyectos (owner)
+    const like = `*${q}*`;
+    const orClause = `title.ilike.${like},description_md.ilike.${like}`;
+
     const ownedPromise = supabase
       .from("projects")
-      .select("id,title,visibility,is_hidden,updated_at,owner_user_id")
+      .select("id,title,visibility,is_hidden,updated_at")
       .eq("owner_user_id", userId)
-      .or(`title.ilike.${needle},description_md.ilike.${needle}`)
+      .or(orClause)
       .order("updated_at", { ascending: false })
-      .limit(6);
+      .limit(6)
+      .returns<OwnedRow[]>();
 
-    // Mis proyectos (member)
-    // Nota: requiere FK project_members.project_id -> projects.id
-    const memberPromise = supabase
+    const membershipsPromise = supabase
       .from("project_members")
-      .select("role, projects!inner(id,title,visibility,is_hidden,updated_at)")
+      .select("project_id,role")
       .eq("user_id", userId)
-      .or(`projects.title.ilike.${needle},projects.description_md.ilike.${needle}`)
       .order("created_at", { ascending: false })
-      .limit(8);
+      .limit(40)
+      .returns<MembershipRow[]>();
 
-    // Comunidad
     const communityPromise = supabase
       .from("projects")
-      .select("id,title,visibility,is_hidden,updated_at,published_at")
+      .select("id,title,visibility,is_hidden,updated_at")
       .eq("is_hidden", false)
       .not("published_at", "is", null)
       .in("visibility", ["public", "unlisted"])
-      .or(`title.ilike.${needle},description_md.ilike.${needle}`)
+      .or(orClause)
       .order("updated_at", { ascending: false })
-      .limit(8);
+      .limit(8)
+      .returns<CommunityProjectRow[]>();
 
-    const [{ data: owned, error: ownedErr }, { data: member, error: memErr }, { data: comm, error: commErr }] =
-      await Promise.all([ownedPromise, memberPromise, communityPromise]);
+    const [
+      { data: owned, error: ownedErr },
+      { data: memberships, error: memErr },
+      { data: comm, error: commErr },
+    ] = await Promise.all([ownedPromise, membershipsPromise, communityPromise]);
 
     if (ownedErr) return NextResponse.json({ error: ownedErr.message }, { status: 400 });
     if (memErr) return NextResponse.json({ error: memErr.message }, { status: 400 });
@@ -77,56 +121,61 @@ export async function GET(req: Request) {
         id: p.id,
         title: p.title,
         visibility: p.visibility ?? "private",
-        is_hidden: !!p.is_hidden,
+        is_hidden: Boolean(p.is_hidden),
         updated_at: p.updated_at,
         role: "owner",
       });
     }
-    
-    type MemberRow = {
-    role: "owner" | "editor" | "guest" | null;
-    projects: Array<{
-        id: string;
-        title: string;
-        visibility: string | null;
-        is_hidden: boolean | null;
-        updated_at: string;
-    }>;
-    };
 
-    type CommunityProjectRow = {
-    id: string;
-    title: string;
-    visibility: "private" | "unlisted" | "public" | string | null;
-    is_hidden: boolean | null;
-    updated_at: string;
-    published_at: string | null;
-    };
-    
-    for (const row of (member ?? []) as MemberRow[]) {
-        const p = row.projects[0];
-        if (!p) continue;
+    const memberIds: string[] = [];
+    const roleById = new Map<string, ProjectRole>();
 
-        if (!myMap.has(p.id)) {
-            myMap.set(p.id, {
-            id: p.id,
-            title: p.title,
-            visibility: p.visibility ?? "private",
-            is_hidden: !!p.is_hidden,
-            updated_at: p.updated_at,
-            role: row.role ?? "guest",
-            });
-        }
+    for (const m of memberships ?? []) {
+      if (myMap.has(m.project_id)) continue;
+      memberIds.push(m.project_id);
+      roleById.set(m.project_id, isProjectRole(m.role) ? m.role : "guest");
     }
 
-    const my = Array.from(myMap.values()).slice(0, 8);
-    const community: ProjectHit[] = (comm ?? []).map((p: CommunityProjectRow) => ({
-    id: p.id,
-    title: p.title,
-    visibility: p.visibility ?? "public",
-    is_hidden: !!p.is_hidden,
-    updated_at: p.updated_at,
-    }));
+    let imported: ProjectRowLite[] = [];
+    if (memberIds.length) {
+      const { data: imp, error: impErr } = await supabase
+        .from("projects")
+        .select("id,title,visibility,is_hidden,updated_at")
+        .in("id", memberIds)
+        .or(orClause)
+        .order("updated_at", { ascending: false })
+        .limit(8)
+        .returns<ProjectRowLite[]>();
+
+      if (impErr) return NextResponse.json({ error: impErr.message }, { status: 400 });
+      imported = imp ?? [];
+    }
+
+    for (const p of imported) {
+      if (myMap.has(p.id)) continue;
+      myMap.set(p.id, {
+        id: p.id,
+        title: p.title,
+        visibility: p.visibility ?? "private",
+        is_hidden: Boolean(p.is_hidden),
+        updated_at: p.updated_at,
+        role: roleById.get(p.id) ?? "guest",
+      });
+    }
+
+    const my = Array.from(myMap.values())
+      .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+      .slice(0, 8);
+
+    const community: ProjectHit[] = (comm ?? [])
+      .filter((p) => !myMap.has(p.id))
+      .map((p) => ({
+        id: p.id,
+        title: p.title,
+        visibility: p.visibility ?? "public",
+        is_hidden: Boolean(p.is_hidden),
+        updated_at: p.updated_at,
+      }));
 
     return NextResponse.json({ my, community });
   } catch (e) {

@@ -29,7 +29,6 @@ export function ReportButton(props: { projectId: string; projectTitle?: string }
 
     setOk("Reporte enviado. Gracias.");
     setDesc("");
-    // opcional: cerrar
     setTimeout(() => setOpen(false), 600);
   }
 

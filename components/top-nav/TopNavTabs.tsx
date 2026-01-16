@@ -19,7 +19,6 @@ export async function TopNavTabs() {
     .maybeSingle<ProfileRoleRow>();
 
   if (pErr) {
-    // Si falla por RLS u otra razón, simplemente no mostramos admin tab.
     return <TopNavTabsClient isAdmin={false} />;
   }
 

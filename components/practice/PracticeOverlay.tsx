@@ -26,7 +26,7 @@ type Props = {
   projectId: string;
   groupId: string;
   groupTitle?: string;
-  mode?: PracticeMode; // NUEVO: desde agenda puedes abrir "due" o "all"
+  mode?: PracticeMode;
 };
 
 type SessionSnapshot = {
@@ -102,7 +102,6 @@ export function PracticeOverlay({ open, onClose, projectId, groupId, groupTitle,
     try {
       localStorage.setItem(sessionKey(projectId, groupId), JSON.stringify(snap));
     } catch {
-      // no rompemos UX
     }
   }
 
