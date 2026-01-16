@@ -1,7 +1,7 @@
 // PomodoroDock.tsx
 "use client";
 
-import { useEffect, useMemo, useRef, useState, useId } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useId } from "react";
 import type { ReactNode } from "react";
 import { createClient } from "@/lib/supabase/client";
 
@@ -38,21 +38,46 @@ import {
   VolumeX,
 } from "lucide-react";
 
-/* ----------------- Domain ----------------- */
+/* ----------------- Constantes (sin magia) ----------------- */
+
+const MIN_FOCUS_MINUTES = 1;
+const MAX_FOCUS_MINUTES = 180;
+
+const MIN_SHORT_BREAK_MINUTES = 1;
+const MAX_SHORT_BREAK_MINUTES = 60;
+
+const MIN_LONG_BREAK_MINUTES = 1;
+const MAX_LONG_BREAK_MINUTES = 120;
+
+const MIN_CYCLES_BEFORE_LONG = 1;
+const MAX_CYCLES_BEFORE_LONG = 12;
+
+const MAX_PLANNED_SEC = 24 * 60 * 60;
+
+const TICK_INTERVAL_MS = 250;
+const BROADCAST_DEBOUNCE_MS = 100;
+
+const LAST_USER_KEY = "rutalabs:lastUserId";
+const LS_KEY_OLD = "rutalabs:pomodoro:v1"; // legado (global, inseguro)
+const BC_NAME = "rutalabs:pomodoro:bc";
+
+/* ----------------- Dominio ----------------- */
 
 type Phase = "focus" | "short_break" | "long_break";
 
 /**
- * Nota: en DB `status` es un enum (`pomodoro_status`) que no tengo aquí.
- * Para no romper TypeScript ni asumir valores exactos, lo tratamos como string,
- * pero escribimos "running"/"paused" como valores.
+ * Status local estricto.
+ * Si tu DB usa enum, idealmente alinea esos valores a: running | paused | idle.
  */
-type PomodoroStatus = string;
+type PomodoroStatus = "running" | "paused" | "idle";
+
+/** En DB puede venir un string legacy; lo toleramos sin perder type-safety local. */
+type PomodoroStatusDb = PomodoroStatus | (string & {});
 
 type PomodoroStateRow = {
   user_id: string;
 
-  status: PomodoroStatus | null;
+  status: PomodoroStatusDb | null;
   phase: Phase | null;
 
   started_at: string | null; // timestamptz
@@ -73,59 +98,41 @@ type PomodoroStateRow = {
 type LocalStateV2 = {
   v: 2;
 
-  // Ownership => per-user persistence
+  // Persistencia por usuario
   userId: string;
 
-  // Conflict resolution (CAS/LWW)
+  // Resolución de conflictos (CAS + LWW)
   rev: number;
   updatedAtMs: number;
 
-  // Tab identity
+  // Identidad de pestaña
   clientId: string;
 
-  // Data
+  // Datos
   settings: PomodoroSettings;
   phase: Phase;
   cycleIndex: number;
 
   running: boolean;
 
-  // Running => remaining is computed from end time
+  // Si corre: remaining se deriva de ends
   phaseEndsAtMs: number | null;
 
-  // Paused => remaining lives here
+  // Si no corre: remaining se guarda aquí
   pausedRemainingSec: number;
 
-  // Locked planned duration for current phase
+  // Duración “bloqueada” de la fase actual
   phasePlannedSec: number;
 
-  // For focus session insert
+  // Para insertar sesión de foco
   focusStartedAtIso: string | null;
 };
 
-/* ----------------- Local persistence keys ----------------- */
-
-// Per-user key
-function lsKeyForUser(userId: string) {
-  return `rutalabs:pomodoro:v2:${userId}`;
-}
-
-const LAST_USER_KEY = "rutalabs:lastUserId";
-const LS_KEY_OLD = "rutalabs:pomodoro:v1"; // legacy (global, unsafe)
-const BC_NAME = "rutalabs:pomodoro:bc";
-
-/* ----------------- UI constants ----------------- */
-
-// Ring colors (fallbacks)
-const RING_TRACK = "hsl(var(--muted))";
-const RING_FOCUS_RUNNING = "hsl(var(--primary))";
-const RING_FOCUS_PAUSED = "hsl(var(--primary) / 0.55)";
-const RING_BREAK_RUNNING = "rgb(16 185 129)"; // emerald-500
-const RING_BREAK_PAUSED = "rgb(52 211 153)"; // emerald-400
-const RING_LONG_RUNNING = "rgb(168 85 247)"; // violet-500
-const RING_LONG_PAUSED = "rgb(196 181 253)"; // violet-300
-
 /* ----------------- Utils ----------------- */
+
+function cn(...parts: Array<string | false | null | undefined>) {
+  return parts.filter(Boolean).join(" ");
+}
 
 function clampInt(n: unknown, min: number, max: number, fallback: number): number {
   const x = Number(n);
@@ -147,10 +154,10 @@ function defaultSettings(): PomodoroSettings {
 
 function normalizeSettings(s: PomodoroSettings): PomodoroSettings {
   return {
-    focus_minutes: clampInt(s.focus_minutes, 1, 180, 25),
-    short_break_minutes: clampInt(s.short_break_minutes, 1, 60, 5),
-    long_break_minutes: clampInt(s.long_break_minutes, 1, 120, 15),
-    cycles_before_long_break: clampInt(s.cycles_before_long_break, 1, 12, 4),
+    focus_minutes: clampInt(s.focus_minutes, MIN_FOCUS_MINUTES, MAX_FOCUS_MINUTES, 25),
+    short_break_minutes: clampInt(s.short_break_minutes, MIN_SHORT_BREAK_MINUTES, MAX_SHORT_BREAK_MINUTES, 5),
+    long_break_minutes: clampInt(s.long_break_minutes, MIN_LONG_BREAK_MINUTES, MAX_LONG_BREAK_MINUTES, 15),
+    cycles_before_long_break: clampInt(s.cycles_before_long_break, MIN_CYCLES_BEFORE_LONG, MAX_CYCLES_BEFORE_LONG, 4),
     enable_notifications: Boolean(s.enable_notifications),
     enable_sound: Boolean(s.enable_sound ?? true),
     dock_is_open: Boolean(s.dock_is_open ?? true),
@@ -199,6 +206,16 @@ function parseIsoMs(iso: string | null): number | null {
   return Number.isFinite(ms) ? ms : null;
 }
 
+function ensurePhase(p: unknown): Phase {
+  return p === "short_break" || p === "long_break" || p === "focus" ? p : "focus";
+}
+
+/* ----------------- Persistencia local por usuario ----------------- */
+
+function lsKeyForUser(userId: string) {
+  return `rutalabs:pomodoro:v2:${userId}`;
+}
+
 function getClientId(): string {
   const key = "rutalabs:pomodoro:clientId";
   try {
@@ -217,13 +234,10 @@ function getClientId(): string {
   }
 }
 
-function ensurePhase(p: unknown): Phase {
-  return p === "short_break" || p === "long_break" || p === "focus" ? p : "focus";
-}
-
 function createDefaultState(userId: string, clientId: string): LocalStateV2 {
   const s = defaultSettings();
   const planned = phaseToSeconds("focus", s);
+
   return {
     v: 2,
     userId,
@@ -246,28 +260,24 @@ function sanitizeLoadedV2(raw: LocalStateV2, userId: string, clientId: string): 
   const phase = ensurePhase(raw.phase);
 
   const plannedFallback = phaseToSeconds(phase, settings);
-  const planned = clampInt(raw.phasePlannedSec, 1, 24 * 60 * 60, plannedFallback);
+  const planned = clampInt(raw.phasePlannedSec, 1, MAX_PLANNED_SEC, plannedFallback);
 
   const running = Boolean(raw.running);
   const ends =
-    typeof raw.phaseEndsAtMs === "number" && Number.isFinite(raw.phaseEndsAtMs)
-      ? raw.phaseEndsAtMs
-      : null;
+    typeof raw.phaseEndsAtMs === "number" && Number.isFinite(raw.phaseEndsAtMs) ? raw.phaseEndsAtMs : null;
 
-  const pausedRemaining = clampInt(raw.pausedRemainingSec, 0, 24 * 60 * 60, planned);
+  const pausedRemaining = clampInt(raw.pausedRemainingSec, 0, MAX_PLANNED_SEC, planned);
 
   const rev = clampInt(raw.rev, 0, 1_000_000_000, 0);
   const updatedAtMs =
-    typeof raw.updatedAtMs === "number" && Number.isFinite(raw.updatedAtMs)
-      ? raw.updatedAtMs
-      : Date.now();
+    typeof raw.updatedAtMs === "number" && Number.isFinite(raw.updatedAtMs) ? raw.updatedAtMs : Date.now();
 
   return {
     v: 2,
     userId,
     rev,
     updatedAtMs,
-    clientId, // keep local tab client id
+    clientId, // mantenemos el clientId de esta pestaña
     settings,
     phase,
     cycleIndex: clampInt(raw.cycleIndex, 0, 999, 0),
@@ -280,8 +290,7 @@ function sanitizeLoadedV2(raw: LocalStateV2, userId: string, clientId: string): 
 }
 
 /**
- * Carga solo v2 per-user.
- * Importante: NO migramos v1 global porque NO tiene userId y contamina cuentas nuevas.
+ * Importante: NO migramos v1 global, porque no tiene userId y contamina cuentas.
  */
 function loadLocalStateForUser(userId: string, clientId: string): LocalStateV2 | null {
   const key = lsKeyForUser(userId);
@@ -323,7 +332,7 @@ function stateFocusStartIso(st: LocalStateV2): string | null {
   return null;
 }
 
-/* ----------------- Notifications ----------------- */
+/* ----------------- Notificaciones + sonido (con limpieza) ----------------- */
 
 async function ensureNotificationPermission(): Promise<boolean> {
   if (typeof window === "undefined") return false;
@@ -334,69 +343,49 @@ async function ensureNotificationPermission(): Promise<boolean> {
   return p === "granted";
 }
 
-function playBeep(kind: "focus_end" | "short_end" | "long_end") {
-  const freq = kind === "focus_end" ? 880 : kind === "short_end" ? 660 : 520;
-  const dur = kind === "focus_end" ? 160 : kind === "short_end" ? 140 : 220;
+type BeepKind = "focus_end" | "short_end" | "long_end";
 
-  try {
-    const AudioCtx =
-      window.AudioContext ||
-      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-
-    if (!AudioCtx) return;
-
-    const ctx = new AudioCtx();
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-
-    o.type = "sine";
-    o.frequency.value = freq;
-    g.gain.value = 0.06;
-
-    o.connect(g);
-    g.connect(ctx.destination);
-
-    o.start();
-    window.setTimeout(() => {
-      o.stop();
-      void ctx.close();
-    }, dur);
-  } catch {
-    // no-op
-  }
+function beepParams(kind: BeepKind) {
+  if (kind === "focus_end") return { freq: 880, dur: 160 };
+  if (kind === "short_end") return { freq: 660, dur: 140 };
+  return { freq: 520, dur: 220 };
 }
+
+/* ----------------- Mensajes entre pestañas ----------------- */
 
 type WireMessage = { type: "state"; state: LocalStateV2 };
 
 /* ----------------- DB mapping ----------------- */
 
-const STATUS_RUNNING = "running";
-const STATUS_PAUSED = "paused";
+const STATUS_RUNNING: PomodoroStatus = "running";
+const STATUS_PAUSED: PomodoroStatus = "paused";
 
-/**
- * Convertimos row DB -> LocalStateV2.
- * IMPORTANTE:
- * - settings no vienen en pomodoro_state (vienen de pomodoro_settings), así que se inyectan.
- * - focusStartedAtIso lo tomamos de started_at solo en fase focus.
- */
+function statusFromDb(row: PomodoroStateRow, endsAtMs: number | null): PomodoroStatus {
+  // Preferimos el status; pero si el enum no calza, inferimos por ends_at
+  const raw = String(row.status ?? "").toLowerCase();
+  if (raw === "running") return "running";
+  if (raw === "paused") return "paused";
+  if (raw === "idle") return "idle";
+
+  if (endsAtMs !== null && endsAtMs > Date.now()) return "running";
+  // si no corre, asumimos paused (idle lo usarías si agregas ese estado explícito)
+  return "paused";
+}
+
 function rowToLocalState(row: PomodoroStateRow, settings: PomodoroSettings, clientId: string): LocalStateV2 {
   const phase = ensurePhase(row.phase ?? "focus");
 
   const plannedFallback = phaseToSeconds(phase, settings);
-  const planned = clampInt(row.phase_planned_sec, 1, 24 * 60 * 60, plannedFallback);
+  const planned = clampInt(row.phase_planned_sec, 1, MAX_PLANNED_SEC, plannedFallback);
 
   const endsAtMs = parseIsoMs(row.ends_at);
-  const running =
-    (row.status ?? "") === STATUS_RUNNING ||
-    (endsAtMs !== null && endsAtMs > Date.now()); // fallback si el enum no calza
+  const status = statusFromDb(row, endsAtMs);
+  const running = status === "running";
 
-  const computedRemaining =
-    running && endsAtMs ? Math.max(0, Math.ceil((endsAtMs - Date.now()) / 1000)) : null;
+  const computedRemaining = running && endsAtMs ? Math.max(0, Math.ceil((endsAtMs - Date.now()) / 1000)) : null;
 
   const pausedRemaining =
-    computedRemaining !== null
-      ? computedRemaining
-      : clampInt(row.paused_remaining_sec, 0, 24 * 60 * 60, planned);
+    computedRemaining !== null ? computedRemaining : clampInt(row.paused_remaining_sec, 0, MAX_PLANNED_SEC, planned);
 
   const updatedAtMs = parseIsoMs(row.updated_at) ?? Date.now();
   const rev = clampInt(row.rev, 0, 1_000_000_000, 0);
@@ -418,19 +407,14 @@ function rowToLocalState(row: PomodoroStateRow, settings: PomodoroSettings, clie
   };
 }
 
-/**
- * Convertimos LocalStateV2 -> patch (solo columnas que controlamos).
- * Nota: NO tocamos selected_project_id aquí (para no pisarlo si lo usas en otra parte).
- */
 function localToDbPatch(st: LocalStateV2): Partial<PomodoroStateRow> {
   const endsAtIso = st.running && st.phaseEndsAtMs ? new Date(st.phaseEndsAtMs).toISOString() : null;
 
-  // started_at: derivado de ends - planned si está corriendo; si está en foco, preferimos focusStartedAtIso.
+  // started_at: derivado de ends - planned si corre; en foco preferimos focusStartedAtIso
   let startedAtIso: string | null = null;
 
   if (st.running && st.phaseEndsAtMs) {
-    const derived = new Date(st.phaseEndsAtMs - st.phasePlannedSec * 1000).toISOString();
-    startedAtIso = derived;
+    startedAtIso = new Date(st.phaseEndsAtMs - st.phasePlannedSec * 1000).toISOString();
   }
 
   if (st.phase === "focus") {
@@ -452,7 +436,22 @@ function localToDbPatch(st: LocalStateV2): Partial<PomodoroStateRow> {
   };
 }
 
-/* ----------------- UI meta ----------------- */
+/* ----------------- Transiciones declarativas ----------------- */
+
+function computeNextPhaseFromFocus(nextCycleIndex: number, settings: PomodoroSettings): Phase {
+  const every = Math.max(1, settings.cycles_before_long_break);
+  const goLong = nextCycleIndex % every === 0;
+  return goLong ? "long_break" : "short_break";
+}
+
+function isPhaseComplete(cur: LocalStateV2): boolean {
+  if (!cur.running) return false;
+  const ends = cur.phaseEndsAtMs;
+  const remNow = ends ? Math.max(0, Math.ceil((ends - Date.now()) / 1000)) : cur.pausedRemainingSec;
+  return remNow === 0;
+}
+
+/* ----------------- UI meta (clases Tailwind) ----------------- */
 
 const PHASE_META: Record<
   Phase,
@@ -460,8 +459,8 @@ const PHASE_META: Record<
     label: string;
     subtitle: string;
     Icon: typeof Brain;
-    ringRunning: string;
-    ringPaused: string;
+    ringRunningClass: string; // ej: "stroke-emerald-500"
+    ringPausedClass: string; // ej: "stroke-emerald-400"
     hint: string;
   }
 > = {
@@ -469,29 +468,29 @@ const PHASE_META: Record<
     label: "Foco",
     subtitle: "Concentración",
     Icon: Brain,
-    ringRunning: RING_FOCUS_RUNNING,
-    ringPaused: RING_FOCUS_PAUSED,
+    ringRunningClass: "stroke-primary",
+    ringPausedClass: "stroke-primary/50",
     hint: "Trabajo sin distracciones.",
   },
   short_break: {
     label: "Descanso",
     subtitle: "Recuperación",
     Icon: Coffee,
-    ringRunning: RING_BREAK_RUNNING,
-    ringPaused: RING_BREAK_PAUSED,
+    ringRunningClass: "stroke-emerald-500",
+    ringPausedClass: "stroke-emerald-400",
     hint: "Pausa breve: respira, camina, hidrátate.",
   },
   long_break: {
     label: "Largo",
     subtitle: "Recuperación larga",
     Icon: AlarmClock,
-    ringRunning: RING_LONG_RUNNING,
-    ringPaused: RING_LONG_PAUSED,
+    ringRunningClass: "stroke-violet-500",
+    ringPausedClass: "stroke-violet-300",
     hint: "Pausa larga para resetear energía.",
   },
 };
 
-/* ----------------- Component ----------------- */
+/* ----------------- Componente ----------------- */
 
 export function PomodoroDock() {
   const clientIdRef = useRef<string>(getClientId());
@@ -499,18 +498,19 @@ export function PomodoroDock() {
   const [booted, setBooted] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
 
-  // v2 single source of truth (client state)
+  // Fuente de verdad en cliente
   const [st, setSt] = useState<LocalStateV2 | null>(null);
   const stRef = useRef<LocalStateV2 | null>(null);
+
   useEffect(() => {
     stRef.current = st;
   }, [st]);
 
-  // Lightweight clock while running
+  // “Clock” liviano solo mientras corre
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const tickRef = useRef<number | null>(null);
 
-  // Avoid spamming phase-end attempts
+  // Evita loops de fin de fase
   const phaseEndInFlightRef = useRef(false);
 
   // BroadcastChannel
@@ -519,7 +519,20 @@ export function PomodoroDock() {
   // Realtime channel
   const rtRef = useRef<ReturnType<ReturnType<typeof createClient>["channel"]> | null>(null);
 
+  // Debounce de broadcast (reduce spam)
+  const broadcastQueueRef = useRef<LocalStateV2 | null>(null);
+  const broadcastTimerRef = useRef<number | null>(null);
+
+  // AudioContext (se cierra al desmontar)
+  const audioCtxRef = useRef<AudioContext | null>(null);
+
+  // Accesibilidad / focus management
+  const dockRef = useRef<HTMLDivElement | null>(null);
+
   const open = st?.settings.dock_is_open ?? true;
+
+  // Hover micro-interactions
+  const [isHovering, setIsHovering] = useState(false);
 
   const remainingSec = useMemo(() => {
     if (!st) return 0;
@@ -539,8 +552,6 @@ export function PomodoroDock() {
     const done = 1 - remainingSec / total;
     return Math.max(0, Math.min(1, done));
   }, [st, remainingSec]);
-
-  const progressDeg = Math.round(progress * 360);
 
   const statusLabel = useMemo(() => {
     if (!st) return "Pausado";
@@ -562,20 +573,100 @@ export function PomodoroDock() {
     return `Largo en ${longIn}`;
   }, [st, longIn]);
 
+  const meta = useMemo(() => (st ? PHASE_META[st.phase] : PHASE_META.focus), [st?.phase]);
+  const ringRunningClass = meta.ringRunningClass;
+  const ringPausedClass = meta.ringPausedClass;
+
+  /* ----------------- Helpers: beep limpio ----------------- */
+
+  const playBeep = useCallback((kind: BeepKind) => {
+    try {
+      const { freq, dur } = beepParams(kind);
+
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+
+      if (!AudioCtx) return;
+
+      if (!audioCtxRef.current) audioCtxRef.current = new AudioCtx();
+      const ctx = audioCtxRef.current;
+
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+
+      o.type = "sine";
+      o.frequency.value = freq;
+      g.gain.value = 0.06;
+
+      o.connect(g);
+      g.connect(ctx.destination);
+
+      o.start();
+
+      window.setTimeout(() => {
+        try {
+          o.stop();
+          o.disconnect();
+          g.disconnect();
+        } catch {
+          // no-op
+        }
+      }, dur);
+    } catch {
+      // no-op
+    }
+  }, []);
+
+  useEffect(() => {
+    // Limpieza del audio context para evitar leaks
+    return () => {
+      try {
+        void audioCtxRef.current?.close();
+      } catch {
+        // no-op
+      }
+      audioCtxRef.current = null;
+    };
+  }, []);
+
+  /* ----------------- Broadcast debounced ----------------- */
+
+  const queueBroadcast = useCallback((next: LocalStateV2) => {
+    if (!bcRef.current) return;
+
+    broadcastQueueRef.current = next;
+
+    if (broadcastTimerRef.current) window.clearTimeout(broadcastTimerRef.current);
+    broadcastTimerRef.current = window.setTimeout(() => {
+      const queued = broadcastQueueRef.current;
+      broadcastQueueRef.current = null;
+      if (!queued) return;
+
+      try {
+        const msg: WireMessage = { type: "state", state: queued };
+        bcRef.current?.postMessage(msg);
+      } catch {
+        // no-op
+      }
+    }, BROADCAST_DEBOUNCE_MS);
+  }, []);
+
+  useEffect(() => {
+    // Limpieza del debounce
+    return () => {
+      if (broadcastTimerRef.current) window.clearTimeout(broadcastTimerRef.current);
+      broadcastTimerRef.current = null;
+      broadcastQueueRef.current = null;
+    };
+  }, []);
+
   /* ----------------- Local apply/broadcast ----------------- */
 
   function applyLocal(next: LocalStateV2) {
     setSt(next);
     if (userId) saveLocalStateForUser(userId, next);
-
-    if (bcRef.current) {
-      const msg: WireMessage = { type: "state", state: next };
-      try {
-        bcRef.current.postMessage(msg);
-      } catch {
-        // no-op
-      }
-    }
+    queueBroadcast(next);
   }
 
   function applyRemote(incoming: LocalStateV2) {
@@ -591,7 +682,7 @@ export function PomodoroDock() {
 
       if (!lwwNewer(incoming, cur)) return cur;
 
-      // Importante: preservar settings locales (vienen de pomodoro_settings)
+      // Preservamos settings locales (se sincronizan por pomodoro_settings)
       const mergedIncoming = sanitizeLoadedV2(
         { ...incoming, settings: cur.settings, clientId: cur.clientId } as LocalStateV2,
         userId,
@@ -605,7 +696,10 @@ export function PomodoroDock() {
 
   /* ----------------- DB sync (CAS) ----------------- */
 
-  async function fetchServerState(supabase: ReturnType<typeof createClient>, uid: string): Promise<PomodoroStateRow | null> {
+  async function fetchServerState(
+    supabase: ReturnType<typeof createClient>,
+    uid: string
+  ): Promise<PomodoroStateRow | null> {
     const { data, error } = await supabase
       .from("pomodoro_state")
       .select("*")
@@ -617,11 +711,10 @@ export function PomodoroDock() {
   }
 
   async function ensureServerRowExists(supabase: ReturnType<typeof createClient>, base: LocalStateV2) {
-    // Si ya existe, no hacemos nada.
     const existing = await fetchServerState(supabase, base.userId);
     if (existing) return;
 
-    // Insert inicial. Si hay carrera (otro navegador insertó), ignoramos error.
+    // Insert inicial. Si hay carrera, ignoramos.
     const patch = localToDbPatch(base);
     try {
       await supabase.from("pomodoro_state").insert({
@@ -648,10 +741,7 @@ export function PomodoroDock() {
       .eq("rev", expectedPrevRev)
       .select("*");
 
-    if (error) {
-      // Si falla por RLS o red, tratamos como conflicto lógico (refetch).
-      return { ok: false, conflict: true };
-    }
+    if (error) return { ok: false, conflict: true };
 
     const rows = (data as PomodoroStateRow[]) ?? [];
     if (rows.length !== 1) return { ok: false, conflict: true };
@@ -681,14 +771,13 @@ export function PomodoroDock() {
       settings: prev.settings, // settings se manejan aparte
     };
 
-    // Optimistic local update
+    // Optimista
     applyLocal(stamped);
 
-    // CAS update en servidor
+    // CAS
     const res = await pushStateCAS(supabase, uid, prev.rev, stamped);
 
     if (res.ok) {
-      // Convertimos a LocalState desde row para normalizar rev/updated_at real del server (y para otros clientes).
       const committedLocal = rowToLocalState(res.row, stamped.settings, stamped.clientId);
 
       // Preservamos settings actuales
@@ -710,7 +799,7 @@ export function PomodoroDock() {
       return;
     }
 
-    // Conflicto: alguien más escribió primero -> refetch y aplicar remoto
+    // Conflicto => refetch
     const latest = await fetchServerState(supabase, uid);
     if (latest) {
       const remote = rowToLocalState(latest, prev.settings, prev.clientId);
@@ -728,12 +817,12 @@ export function PomodoroDock() {
       setBooted(true);
       setUserId(null);
       setSt(null);
-      return;
+      return undefined;
     }
 
     const uid = data.user.id;
 
-    // Si cambió el usuario en este navegador, limpiamos legacy v1 (global) para evitar contaminación.
+    // Si cambió el usuario, limpiamos v1 global para evitar contaminación
     try {
       const last = localStorage.getItem(LAST_USER_KEY);
       if (last && last !== uid) {
@@ -746,11 +835,11 @@ export function PomodoroDock() {
 
     setUserId(uid);
 
-    // Base settings (local default); luego merge con server settings.
+    // Base local (con defaults)
     const local = loadLocalStateForUser(uid, clientIdRef.current);
     const base = local ?? createDefaultState(uid, clientIdRef.current);
 
-    // Recompute remaining if it was running
+    // Recalcular remaining si venía corriendo
     const computedRemaining =
       base.running && base.phaseEndsAtMs
         ? Math.max(0, Math.ceil((base.phaseEndsAtMs - Date.now()) / 1000))
@@ -761,7 +850,7 @@ export function PomodoroDock() {
       pausedRemainingSec: computedRemaining,
     };
 
-    // Setup BroadcastChannel (same-browser sync)
+    // BroadcastChannel (sincronía entre pestañas del mismo navegador)
     try {
       bcRef.current = "BroadcastChannel" in window ? new BroadcastChannel(BC_NAME) : null;
     } catch {
@@ -779,7 +868,7 @@ export function PomodoroDock() {
       };
     }
 
-    // Storage fallback (same-browser, other tabs)
+    // Storage fallback (otras pestañas)
     const userKey = lsKeyForUser(uid);
     const onStorage = (e: StorageEvent) => {
       if (e.key !== userKey) return;
@@ -789,11 +878,13 @@ export function PomodoroDock() {
     };
     window.addEventListener("storage", onStorage);
 
-    // 1) Cargar settings desde server y mergearlos (sin tocar timing)
+    // 1) Settings desde server
     const settingsRes = await getPomodoroSettingsAction();
-    const mergedSettings = settingsRes.ok ? normalizeSettings(settingsRes.data) : normalizeSettings(normalizedBase.settings);
+    const mergedSettings = settingsRes.ok
+      ? normalizeSettings(settingsRes.data)
+      : normalizeSettings(normalizedBase.settings);
 
-    // 2) Aplicar base local con settings ya mergeados (UI inmediata)
+    // 2) Aplicar base inmediata con settings
     const baseWithSettings: LocalStateV2 = {
       ...normalizedBase,
       settings: mergedSettings,
@@ -803,15 +894,14 @@ export function PomodoroDock() {
 
     applyLocal(baseWithSettings);
 
-    // 3) Asegurar row existe y traer estado desde server (multi-browser sync)
+    // 3) Asegurar row y traer state (multi-browser)
     await ensureServerRowExists(supabase, baseWithSettings);
 
     const serverRow = await fetchServerState(supabase, uid);
     if (serverRow) {
       const serverState = rowToLocalState(serverRow, mergedSettings, clientIdRef.current);
-
-      // Elegir el más nuevo entre local y server
       const winner = lwwNewer(serverState, baseWithSettings) ? serverState : baseWithSettings;
+
       applyLocal({
         ...winner,
         settings: mergedSettings,
@@ -819,7 +909,7 @@ export function PomodoroDock() {
       });
     }
 
-    // 4) Realtime: escuchar cambios de pomodoro_state para este usuario (entre navegadores)
+    // 4) Realtime: escuchar cambios
     try {
       if (rtRef.current) {
         try {
@@ -850,6 +940,7 @@ export function PomodoroDock() {
 
     setBooted(true);
 
+    // Cleanup garantizado (previene leaks)
     return () => {
       window.removeEventListener("storage", onStorage);
 
@@ -873,7 +964,7 @@ export function PomodoroDock() {
     };
   }
 
-  // Boot + subscribe to auth changes (important for switching accounts)
+  // Boot + cambios auth (switch de cuenta)
   useEffect(() => {
     const supabase = createClient();
 
@@ -886,7 +977,6 @@ export function PomodoroDock() {
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
       const uid = session?.user?.id ?? null;
 
-      // Reset immediately; then bootstrap if signed in.
       setUserId(uid);
       setSt(null);
 
@@ -902,6 +992,7 @@ export function PomodoroDock() {
 
     return () => {
       if (cleanup) cleanup();
+
       try {
         sub.subscription.unsubscribe();
       } catch {
@@ -929,10 +1020,11 @@ export function PomodoroDock() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /* ----------------- Tick only while running ----------------- */
+  /* ----------------- Tick solo si corre (sin leaks) ----------------- */
 
   useEffect(() => {
     if (!booted) return;
+
     if (!st?.running) {
       if (tickRef.current) window.clearInterval(tickRef.current);
       tickRef.current = null;
@@ -943,7 +1035,7 @@ export function PomodoroDock() {
 
     tickRef.current = window.setInterval(() => {
       setNowMs(Date.now());
-    }, 250);
+    }, TICK_INTERVAL_MS);
 
     return () => {
       if (tickRef.current) window.clearInterval(tickRef.current);
@@ -951,7 +1043,14 @@ export function PomodoroDock() {
     };
   }, [booted, st?.running]);
 
-  /* ----------------- Phase end transition (CAS leader) ----------------- */
+  /* ----------------- Focus al abrir panel (A11y) ----------------- */
+
+  useEffect(() => {
+    if (!booted) return;
+    if (open) dockRef.current?.focus();
+  }, [booted, open]);
+
+  /* ----------------- Fin de fase (líder vía CAS) ----------------- */
 
   useEffect(() => {
     if (!booted) return;
@@ -969,14 +1068,10 @@ export function PomodoroDock() {
       const prev = stRef.current;
       if (!prev) return;
 
-      // Beep/Notification (permitimos que ocurra en cada navegador)
+      // Sonido + notificación (permitimos en cada navegador)
       if (prev.settings.enable_sound) {
-        const kind =
-          prev.phase === "focus"
-            ? "focus_end"
-            : prev.phase === "short_break"
-            ? "short_end"
-            : "long_end";
+        const kind: BeepKind =
+          prev.phase === "focus" ? "focus_end" : prev.phase === "short_break" ? "short_end" : "long_end";
         playBeep(kind);
       }
 
@@ -985,28 +1080,21 @@ export function PomodoroDock() {
         if (ok) new Notification("RutaLabs Pomodoro", { body: `Terminó: ${phaseLabel(prev.phase)}` });
       }
 
-      // Pre-compute session insert (solo el líder lo ejecuta)
+      // Precomputo para inserción (solo líder)
       const focusStartIso = stateFocusStartIso(prev);
       const endedAtIso = new Date().toISOString();
 
       await commitWithServer(
         (cur) => {
-          // OJO: cur puede haber cambiado (por remoto). Usamos cur.
+          // Si ya no está completo, no hacemos nada
+          if (!isPhaseComplete(cur)) return cur;
+
           const s = cur.settings;
-
-          // Si ya no está en 0/running, no transicionamos.
-          const ends = cur.phaseEndsAtMs;
-          const remNow =
-            cur.running && ends ? Math.max(0, Math.ceil((ends - Date.now()) / 1000)) : cur.pausedRemainingSec;
-
-          if (!cur.running || remNow !== 0) return cur;
 
           if (cur.phase === "focus") {
             const nextCycle = cur.cycleIndex + 1;
-            const every = Math.max(1, s.cycles_before_long_break);
-            const goLong = nextCycle % every === 0;
+            const nextPhase = computeNextPhaseFromFocus(nextCycle, s);
 
-            const nextPhase: Phase = goLong ? "long_break" : "short_break";
             const nextTotal = phaseToSeconds(nextPhase, s);
             const nextEndsAt = Date.now() + nextTotal * 1000;
 
@@ -1022,6 +1110,7 @@ export function PomodoroDock() {
             };
           }
 
+          // Descansos vuelven a foco
           const focusTotal = phaseToSeconds("focus", s);
           const nextEndsAt = Date.now() + focusTotal * 1000;
           const startedAtIso = new Date().toISOString();
@@ -1038,10 +1127,11 @@ export function PomodoroDock() {
         },
         {
           onLeaderCommit: async (prevLocal) => {
-            // Insert de sesión solo si el foco terminó y teníamos start
+            // Insertamos sesión solo si terminó foco y teníamos start
             if (prevLocal.phase === "focus" && focusStartIso) {
               const startedMs = new Date(focusStartIso).getTime();
               const endedMs = new Date(endedAtIso).getTime();
+
               const elapsedSec =
                 Number.isFinite(startedMs) && Number.isFinite(endedMs) && endedMs >= startedMs
                   ? Math.max(1, Math.round((endedMs - startedMs) / 1000))
@@ -1058,7 +1148,7 @@ export function PomodoroDock() {
         }
       );
     })().catch(() => {
-      // Si algo explotó, al menos detenemos localmente para no quedar en loop.
+      // Si explota, detenemos para no entrar en loop
       const cur = stRef.current;
       if (!cur || !userId) return;
 
@@ -1073,16 +1163,16 @@ export function PomodoroDock() {
       applyLocal(stopped);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [booted, remainingSec]);
+  }, [booted, remainingSec, playBeep]);
 
-  /* ----------------- Actions ----------------- */
+  /* ----------------- Acciones ----------------- */
 
   async function persistSettings(next: PomodoroSettings, dockOpen = st?.settings.dock_is_open ?? true) {
     if (!st) return;
 
     const normalized = normalizeSettings({ ...next, dock_is_open: dockOpen });
 
-    // Local immediate (settings); el runtime va por pomodoro_state, settings por pomodoro_settings.
+    // Local inmediato
     setSt((cur) => {
       if (!cur) return cur;
       const updated: LocalStateV2 = { ...cur, settings: normalized, updatedAtMs: Date.now() };
@@ -1200,7 +1290,7 @@ export function PomodoroDock() {
 
   function toggleOpen() {
     if (!st) return;
-    void persistSettings(st.settings, !open);
+    void persistSettings(st.settings, !(st.settings.dock_is_open ?? true));
   }
 
   /* ----------------- Render ----------------- */
@@ -1208,19 +1298,23 @@ export function PomodoroDock() {
   if (!booted) return null;
   if (!st || !userId) return null;
 
-  const meta = PHASE_META[st.phase];
-  const ringRunning = meta.ringRunning;
-  const ringPaused = meta.ringPaused;
-
   return (
-    <div className="fixed bottom-4 right-4 z-50">
+    <div
+      ref={dockRef}
+      tabIndex={-1}
+      className="fixed bottom-4 right-4 z-50 outline-none"
+      aria-label="Dock Pomodoro"
+    >
       {!open ? (
         <div className="w-[312px] max-w-[92vw]">
           <Card
-            className={[
-              "rounded-2xl border bg-card/80 backdrop-blur supports-[backdrop-filter]:bg-card/60",
-              "shadow-sm hover:shadow-md transition cursor-pointer overflow-hidden",
-            ].join(" ")}
+            className={cn(
+              "rounded-2xl border bg-card/80 backdrop-blur supports-[backdrop-filter]:bg-card/60 overflow-hidden cursor-pointer",
+              "transition-all duration-300",
+              isHovering && "scale-[1.01] shadow-md"
+            )}
+            onMouseEnter={() => setIsHovering(true)}
+            onMouseLeave={() => setIsHovering(false)}
             onClick={toggleOpen}
             role="button"
             aria-label="Abrir Pomodoro"
@@ -1228,11 +1322,11 @@ export function PomodoroDock() {
             <div className="p-3">
               <div className="flex items-center gap-3">
                 <MiniTimerCircle
-                  progressDeg={progressDeg}
+                  progress={progress}
                   text={formatMMSS(remainingSec)}
                   running={st.running}
-                  ringRunning={ringRunning}
-                  ringPaused={ringPaused}
+                  ringRunningClass={ringRunningClass}
+                  ringPausedClass={ringPausedClass}
                 />
 
                 <div className="min-w-0 flex-1">
@@ -1355,12 +1449,13 @@ export function PomodoroDock() {
             <div className="px-4 py-4 space-y-4">
               <div className="flex items-center justify-center pt-1">
                 <TimerCircle
-                  progressDeg={progressDeg}
+                  progress={progress}
                   time={formatMMSS(remainingSec)}
                   subtitle={`${phaseLabel(st.phase)} · ${statusLabel}`}
                   running={st.running}
-                  ringRunning={ringRunning}
-                  ringPaused={ringPaused}
+                  ringRunningClass={ringRunningClass}
+                  ringPausedClass={ringPausedClass}
+                  ariaLabel={`${formatMMSS(remainingSec)} restantes en ${phaseLabel(st.phase)}. Estado: ${statusLabel}.`}
                 />
               </div>
 
@@ -1420,10 +1515,7 @@ export function PomodoroDock() {
                 />
               </div>
 
-              <SettingsPanel
-                settings={st.settings}
-                onChange={(next, dockOpen) => void persistSettings(next, dockOpen)}
-              />
+              <SettingsPanel settings={st.settings} onChange={(next, dockOpen) => void persistSettings(next, dockOpen)} />
             </div>
           </Card>
         </div>
@@ -1434,34 +1526,73 @@ export function PomodoroDock() {
 
 /* ----------------- UI helpers ----------------- */
 
-function TimerCircle(props: {
-  progressDeg: number;
-  time: string;
-  subtitle: string;
+/**
+ * Indicador circular basado en SVG.
+ * Ventajas:
+ * - Animación suave vía transición CSS (stroke-dashoffset)
+ * - Colores con clases Tailwind (ej: stroke-emerald-500)
+ * - Mejor accesibilidad (aria-live)
+ */
+function CircleProgress(props: {
+  size: number;
+  stroke: number;
+  progress: number; // 0..1
   running: boolean;
-  ringRunning: string;
-  ringPaused: string;
+  ringRunningClass: string;
+  ringPausedClass: string;
+  children: ReactNode;
+  ariaLabel?: string;
+  ariaLive?: "off" | "polite";
 }) {
-  const ringColor = props.running ? props.ringRunning : props.ringPaused;
-  const bg = `conic-gradient(from 90deg, ${ringColor} ${props.progressDeg}deg, ${RING_TRACK} 0deg)`;
+  const r = (props.size - props.stroke) / 2;
+  const c = 2 * Math.PI * r;
+
+  const clamped = Math.max(0, Math.min(1, props.progress));
+  const offset = c * (1 - clamped);
+
+  const ringClass = props.running ? props.ringRunningClass : props.ringPausedClass;
 
   return (
     <div
-      className="relative grid place-items-center rounded-full"
-      style={{ width: 184, height: 184, background: bg, padding: 10 }}
-      aria-label="Temporizador Pomodoro"
+      className="relative grid place-items-center"
+      style={{ width: props.size, height: props.size }}
+      aria-label={props.ariaLabel}
+      aria-live={props.ariaLive ?? "off"}
     >
-      <div className="grid place-items-center rounded-full bg-card border w-full h-full shadow-inner">
-        <div className="text-center px-4">
-          <div className="text-4xl font-semibold tracking-tight tabular-nums">{props.time}</div>
-          <div className="mt-1 text-xs text-muted-foreground">{props.subtitle}</div>
-        </div>
+      <svg width={props.size} height={props.size} className="absolute inset-0 -rotate-90">
+        {/* Track */}
+        <circle
+          cx={props.size / 2}
+          cy={props.size / 2}
+          r={r}
+          fill="none"
+          className="stroke-muted"
+          strokeWidth={props.stroke}
+          opacity={0.5}
+        />
+        {/* Progress */}
+        <circle
+          cx={props.size / 2}
+          cy={props.size / 2}
+          r={r}
+          fill="none"
+          className={cn(ringClass)}
+          strokeWidth={props.stroke}
+          strokeLinecap="round"
+          strokeDasharray={c}
+          strokeDashoffset={offset}
+          style={{ transition: "stroke-dashoffset 220ms ease" }}
+        />
+      </svg>
+
+      <div className="relative grid place-items-center rounded-full bg-card border w-[calc(100%-20px)] h-[calc(100%-20px)] shadow-inner">
+        {props.children}
       </div>
 
       {props.running ? (
         <div
           className="absolute inset-0 rounded-full"
-          style={{ boxShadow: "0 0 0 2px rgba(255,255,255,0.06), 0 0 28px rgba(0,0,0,0.22)" }}
+          style={{ boxShadow: "0 0 0 2px rgba(255,255,255,0.06), 0 0 28px rgba(0,0,0,0.18)" }}
           aria-hidden="true"
         />
       ) : null}
@@ -1469,31 +1600,60 @@ function TimerCircle(props: {
   );
 }
 
+function TimerCircle(props: {
+  progress: number;
+  time: string;
+  subtitle: string;
+  running: boolean;
+  ringRunningClass: string;
+  ringPausedClass: string;
+  ariaLabel: string;
+}) {
+  return (
+    <CircleProgress
+      size={184}
+      stroke={10}
+      progress={props.progress}
+      running={props.running}
+      ringRunningClass={props.ringRunningClass}
+      ringPausedClass={props.ringPausedClass}
+      ariaLabel={props.ariaLabel}
+      ariaLive={props.running ? "polite" : "off"}
+    >
+      <div className="text-center px-4">
+        <div className="text-4xl font-semibold tracking-tight tabular-nums">{props.time}</div>
+        <div className="mt-1 text-xs text-muted-foreground">{props.subtitle}</div>
+      </div>
+    </CircleProgress>
+  );
+}
+
 function MiniTimerCircle(props: {
-  progressDeg: number;
+  progress: number;
   text: string;
   running: boolean;
-  ringRunning: string;
-  ringPaused: string;
+  ringRunningClass: string;
+  ringPausedClass: string;
 }) {
-  const ringColor = props.running ? props.ringRunning : props.ringPaused;
-  const bg = `conic-gradient(from 90deg, ${ringColor} ${props.progressDeg}deg, ${RING_TRACK} 0deg)`;
+  const size = 46;
 
+  // Mini: usamos el mismo componente, pero un contenido más compacto
   return (
-    <div
-      className="relative grid place-items-center rounded-full"
-      style={{ width: 46, height: 46, background: bg, padding: 4 }}
-      aria-label="Mini temporizador"
-    >
-      <div className="grid place-items-center rounded-full bg-card border w-full h-full">
+    <div className="relative">
+      <CircleProgress
+        size={size}
+        stroke={6}
+        progress={props.progress}
+        running={props.running}
+        ringRunningClass={props.ringRunningClass}
+        ringPausedClass={props.ringPausedClass}
+        ariaLabel={`Mini temporizador: ${props.text}`}
+      >
         <div className="text-[11px] font-semibold tabular-nums">{props.text}</div>
-      </div>
+      </CircleProgress>
 
       <div
-        className={[
-          "absolute -bottom-1 -right-1 h-3 w-3 rounded-full border bg-card",
-          props.running ? "animate-pulse" : "",
-        ].join(" ")}
+        className={cn("absolute -bottom-1 -right-1 h-3 w-3 rounded-full border bg-card", props.running && "animate-pulse")}
         aria-hidden="true"
       />
     </div>
@@ -1508,6 +1668,7 @@ function PhaseSegment(props: { active: boolean; label: string; icon: ReactNode; 
       size="sm"
       className="h-10 rounded-xl justify-center gap-2"
       onClick={props.onClick}
+      aria-pressed={props.active}
     >
       {props.icon}
       <span className="text-sm">{props.label}</span>
@@ -1529,6 +1690,7 @@ function TogglePill(props: {
       size="sm"
       className="rounded-full h-9 gap-2"
       onClick={props.onToggle}
+      aria-pressed={props.value}
     >
       {props.value ? props.iconOn : props.iconOff}
       <span className="text-sm">{props.label}</span>
@@ -1540,10 +1702,10 @@ function TogglePill(props: {
 function Badge(props: { children: ReactNode; subtle?: boolean }) {
   return (
     <span
-      className={[
+      className={cn(
         "text-[10px] px-2 py-0.5 rounded-full border whitespace-nowrap",
-        props.subtle ? "bg-muted/15 text-muted-foreground" : "bg-muted/35 text-muted-foreground",
-      ].join(" ")}
+        props.subtle ? "bg-muted/15 text-muted-foreground" : "bg-muted/35 text-muted-foreground"
+      )}
     >
       {props.children}
     </span>
@@ -1655,9 +1817,7 @@ function Field(props: {
   return (
     <div className="space-y-1">
       <label htmlFor={id} className="text-xs text-muted-foreground flex items-center gap-2">
-        <span className="inline-flex h-6 w-6 items-center justify-center rounded-lg border bg-muted/20">
-          {props.icon}
-        </span>
+        <span className="inline-flex h-6 w-6 items-center justify-center rounded-lg border bg-muted/20">{props.icon}</span>
         <span className="font-medium text-foreground/90">{props.label}</span>
         {props.suffix ? <span className="opacity-70">({props.suffix})</span> : null}
       </label>
@@ -1684,6 +1844,7 @@ function SettingsPanel(props: {
         type="button"
         className="w-full px-3 py-2 flex items-center justify-between bg-muted/10 hover:bg-muted/15 transition"
         onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
       >
         <div className="flex items-center gap-2">
           <Settings2 className="h-4 w-4" />
@@ -1703,10 +1864,7 @@ function SettingsPanel(props: {
               value={props.settings.focus_minutes}
               onChange={(v) =>
                 props.onChange(
-                  {
-                    ...props.settings,
-                    focus_minutes: clampInt(v, 1, 180, props.settings.focus_minutes),
-                  },
+                  { ...props.settings, focus_minutes: clampInt(v, MIN_FOCUS_MINUTES, MAX_FOCUS_MINUTES, props.settings.focus_minutes) },
                   props.settings.dock_is_open ?? true
                 )
               }
@@ -1720,7 +1878,7 @@ function SettingsPanel(props: {
                 props.onChange(
                   {
                     ...props.settings,
-                    short_break_minutes: clampInt(v, 1, 60, props.settings.short_break_minutes),
+                    short_break_minutes: clampInt(v, MIN_SHORT_BREAK_MINUTES, MAX_SHORT_BREAK_MINUTES, props.settings.short_break_minutes),
                   },
                   props.settings.dock_is_open ?? true
                 )
@@ -1735,7 +1893,7 @@ function SettingsPanel(props: {
                 props.onChange(
                   {
                     ...props.settings,
-                    long_break_minutes: clampInt(v, 1, 120, props.settings.long_break_minutes),
+                    long_break_minutes: clampInt(v, MIN_LONG_BREAK_MINUTES, MAX_LONG_BREAK_MINUTES, props.settings.long_break_minutes),
                   },
                   props.settings.dock_is_open ?? true
                 )
@@ -1750,12 +1908,7 @@ function SettingsPanel(props: {
                 props.onChange(
                   {
                     ...props.settings,
-                    cycles_before_long_break: clampInt(
-                      v,
-                      1,
-                      12,
-                      props.settings.cycles_before_long_break
-                    ),
+                    cycles_before_long_break: clampInt(v, MIN_CYCLES_BEFORE_LONG, MAX_CYCLES_BEFORE_LONG, props.settings.cycles_before_long_break),
                   },
                   props.settings.dock_is_open ?? true
                 )
@@ -1773,10 +1926,7 @@ function SettingsPanel(props: {
                 void (async () => {
                   if (!props.settings.enable_notifications) await ensureNotificationPermission();
                   props.onChange(
-                    {
-                      ...props.settings,
-                      enable_notifications: !props.settings.enable_notifications,
-                    },
+                    { ...props.settings, enable_notifications: !props.settings.enable_notifications },
                     props.settings.dock_is_open ?? true
                   );
                 })();
