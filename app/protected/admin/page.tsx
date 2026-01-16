@@ -1,15 +1,21 @@
 // app/protected/admin/page.tsx
 import { redirect } from "next/navigation";
+import { Suspense } from "react";
+
 import { createClient } from "@/lib/supabase/server";
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import AdminReportsClient from "./reports-client";
+
+import type { PostgrestError } from "@supabase/supabase-js";
+
+type ReportStatus = "open" | "resolved" | "dismissed";
 
 type ReportRow = {
   id: string;
   project_id: string;
   reporter_user_id: string;
   description: string;
-  status: "open" | "resolved" | "dismissed";
+  status: ReportStatus;
   admin_note: string | null;
   created_at: string;
   updated_at: string;
@@ -32,26 +38,98 @@ type ProfileMin = {
   email: string | null;
 };
 
-export default async function AdminPage() {
-  const supabase = await createClient();
-  const { data: userRes } = await supabase.auth.getUser();
-  if (!userRes.user) redirect("/auth/login");
+type GlobalRoleRow = { global_role: string | null };
 
-  // Verificar admin
-  const { data: prof } = await supabase
-    .from("profiles")
-    .select("global_role")
-    .eq("id", userRes.user.id)
-    .maybeSingle<{ global_role: string | null }>();
+type ReportJoined = ReportRow & {
+  project?: (ProjectMin & { owner?: ProfileMin | null }) | null;
+  reporter?: ProfileMin | null;
+};
+
+export type AdminRow = {
+  report: ReportRow;
+  project: ProjectMin | null;
+  reporter: ProfileMin | null;
+  owner: ProfileMin | null;
+};
+
+export default async function AdminPage() {
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-xl font-semibold">Administración</h1>
+          <p className="text-sm text-muted-foreground">
+            Revisión de reportes y moderación de proyectos públicos.
+          </p>
+        </div>
+      </div>
+
+      <Suspense fallback={<AdminSkeleton />}>
+        <AdminReportsLoader />
+      </Suspense>
+    </div>
+  );
+}
+
+async function AdminReportsLoader() {
+  const supabase = await createClient();
+
+  const userPromise = supabase.auth.getUser();
+
+  const rolePromise: Promise<{ data: GlobalRoleRow | null; error: PostgrestError | null }> =
+    (async () => {
+      const { data: userData } = await userPromise;
+      const uid = userData.user?.id ?? null;
+
+      if (!uid) return { data: null, error: null };
+
+      const res = await supabase
+        .from("profiles")
+        .select("global_role")
+        .eq("id", uid)
+        .maybeSingle<GlobalRoleRow>();
+
+      return { data: res.data ?? null, error: res.error ?? null };
+    })();
+
+  const [{ data: userData, error: userErr }, { data: prof, error: profErr }] =
+    await Promise.all([userPromise, rolePromise]);
+
+  if (userErr || !userData.user) redirect("/auth/login");
+
+  if (profErr) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Error</CardTitle>
+          <CardDescription>{profErr.message}</CardDescription>
+        </CardHeader>
+      </Card>
+    );
+  }
 
   if (!prof || prof.global_role !== "admin") redirect("/protected/home");
 
-  // Reportes (últimos primero)
-  const { data: reports, error: rErr } = await supabase
+  // One query: reports + project + reporter + project owner
+  // IMPORTANT: adjust FK names if your schema differs.
+  const { data: joined, error: rErr } = await supabase
     .from("reports")
-    .select("id,project_id,reporter_user_id,description,status,admin_note,created_at,updated_at")
+    .select(
+      [
+        "id",
+        "project_id",
+        "reporter_user_id",
+        "description",
+        "status",
+        "admin_note",
+        "created_at",
+        "updated_at",
+        "project:projects!reports_project_id_fkey(id,title,owner_user_id,is_hidden,visibility,moderation_note,moderated_at,owner:profiles!projects_owner_user_id_fkey(id,username,avatar_url,email))",
+        "reporter:profiles!reports_reporter_user_id_fkey(id,username,avatar_url,email)",
+      ].join(",")
+    )
     .order("created_at", { ascending: false })
-    .returns<ReportRow[]>();
+    .returns<ReportJoined[]>();
 
   if (rErr) {
     return (
@@ -64,53 +142,35 @@ export default async function AdminPage() {
     );
   }
 
-  const rep = reports ?? [];
-  const projectIds = Array.from(new Set(rep.map((x) => x.project_id)));
-  const reporterIds = Array.from(new Set(rep.map((x) => x.reporter_user_id)));
+  const rows: AdminRow[] = (joined ?? []).map((r) => {
+    const project = r.project ?? null;
+    const reporter = r.reporter ?? null;
+    const owner = project?.owner ?? null;
 
-  // Proyectos
-  const { data: projects } = projectIds.length
-    ? await supabase
-        .from("projects")
-        .select("id,title,owner_user_id,is_hidden,visibility,moderation_note,moderated_at")
-        .in("id", projectIds)
-        .returns<ProjectMin[]>()
-    : { data: [] as ProjectMin[] };
+    const report: ReportRow = {
+      id: r.id,
+      project_id: r.project_id,
+      reporter_user_id: r.reporter_user_id,
+      description: r.description,
+      status: r.status,
+      admin_note: r.admin_note,
+      created_at: r.created_at,
+      updated_at: r.updated_at,
+    };
 
-  const ownerIds = Array.from(new Set((projects ?? []).map((p) => p.owner_user_id)));
-
-  // Perfiles (reporter + owner)
-  const allProfileIds = Array.from(new Set([...reporterIds, ...ownerIds]));
-  const { data: profiles } = allProfileIds.length
-    ? await supabase
-        .from("profiles")
-        .select("id,username,avatar_url,email")
-        .in("id", allProfileIds)
-        .returns<ProfileMin[]>()
-    : { data: [] as ProfileMin[] };
-
-  const projMap = new Map((projects ?? []).map((p) => [p.id, p]));
-  const profMap = new Map((profiles ?? []).map((p) => [p.id, p]));
-
-  const rows = rep.map((r) => {
-    const p = projMap.get(r.project_id) ?? null;
-    const reporter = profMap.get(r.reporter_user_id) ?? null;
-    const owner = p ? profMap.get(p.owner_user_id) ?? null : null;
-    return { report: r, project: p, reporter, owner };
+    return { report, project, reporter, owner };
   });
 
-  return (
-    <div className="space-y-4">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h1 className="text-xl font-semibold">Administración</h1>
-          <p className="text-sm text-muted-foreground">
-            Revisión de reportes y moderación de proyectos públicos.
-          </p>
-        </div>
-      </div>
+  return <AdminReportsClient rows={rows} />;
+}
 
-      <AdminReportsClient rows={rows} />
-    </div>
+function AdminSkeleton() {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">Cargando reportes…</CardTitle>
+        <CardDescription>Obteniendo datos para moderación.</CardDescription>
+      </CardHeader>
+    </Card>
   );
 }

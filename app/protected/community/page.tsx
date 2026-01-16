@@ -1,6 +1,8 @@
-//app/protected/community/page.tsx
+// app/protected/community/page.tsx
 import Link from "next/link";
 import { redirect } from "next/navigation";
+import { Suspense } from "react";
+
 import { createClient } from "@/lib/supabase/server";
 import { ProjectPreviewButton } from "./ProjectPreviewButton";
 
@@ -31,12 +33,15 @@ import { formatDateTimeCL } from "@/lib/datetime";
 
 type SearchParams = {
   error?: string;
-  q?: string; // búsqueda
+  q?: string;
   show?: "all" | "not_imported" | "imported" | "mine";
   sort?: "updated_desc" | "updated_asc" | "published_desc" | "title_asc";
-  author?: string; // búsqueda por username (avanzado)
-  filters?: "1"; // UI: panel abierto
+  author?: string;
+  filters?: "1";
+  page?: string;
 };
+
+const PAGE_SIZE = 24;
 
 function idToString(id: ProjectId): string {
   return String(id);
@@ -54,6 +59,12 @@ function normalizeShow(v: unknown): SearchParams["show"] {
 function normalizeSort(v: unknown): NonNullable<SearchParams["sort"]> {
   if (v === "updated_asc" || v === "published_desc" || v === "title_asc") return v;
   return "updated_desc";
+}
+
+function normalizePage(v: unknown): number {
+  const n = Number(String(v ?? "1"));
+  if (!Number.isFinite(n)) return 1;
+  return Math.max(1, Math.floor(n));
 }
 
 function initialsFromUsername(username: string | null): string {
@@ -92,12 +103,31 @@ type PublicProfile = {
   avatar_url: string | null;
 };
 
+type ProjectWithOwner = ProjectRow & {
+  owner?: PublicProfile | null;
+};
+
 export default async function CommunityPage({
   searchParams,
 }: {
   searchParams: SearchParams | Promise<SearchParams>;
 }) {
   const sp = await Promise.resolve(searchParams);
+
+  return (
+    <div className="space-y-4">
+      <Header />
+      <Filters sp={sp} />
+      {sp.error ? <p className="text-sm text-destructive">{sp.error}</p> : null}
+      <Suspense fallback={<ResultsSkeleton />}>
+        <CommunityResults sp={sp} />
+      </Suspense>
+    </div>
+  );
+}
+
+async function CommunityResults(props: { sp: SearchParams }) {
+  const sp = props.sp;
 
   const qRaw = typeof sp.q === "string" ? sp.q : "";
   const q = safeLike(qRaw);
@@ -108,20 +138,36 @@ export default async function CommunityPage({
   const authorRaw = typeof sp.author === "string" ? sp.author : "";
   const author = safeLike(authorRaw);
 
-  const supabase = await createClient();
-  const { data: userRes } = await supabase.auth.getUser();
-  if (!userRes.user) redirect("/auth/login");
+  const page = normalizePage(sp.page);
+  const from = (page - 1) * PAGE_SIZE;
+  const to = from + PAGE_SIZE - 1;
 
-  // (1) Si hay filtro por autor, resolvemos usernames -> ids (puede ser 0..N)
+  const supabase = await createClient();
+
+  type DbError = { message: string };
+  type AuthorRow = { id: string };
+  type AuthorLookupResult = { data: AuthorRow[] | null; error: DbError | null };
+
+  const userPromise = supabase.auth.getUser();
+
+  const authorPromise: PromiseLike<AuthorLookupResult> = author.trim()
+    ? supabase
+        .from("profiles")
+        .select("id")
+        .ilike("username", `%${author.trim()}%`)
+        .limit(50)
+        .returns<AuthorRow[]>()
+    : Promise.resolve({ data: null, error: null });
+
+  const [{ data: userRes, error: userErr }, { data: authorProfiles, error: aErr }] =
+    await Promise.all([userPromise, authorPromise]);
+
+  if (userErr || !userRes.user) redirect("/auth/login");
+  const userId = userRes.user.id;
+
+  // Author -> ids
   let authorIds: string[] | null = null;
   if (author.trim()) {
-    const { data: authorProfiles, error: aErr } = await supabase
-      .from("profiles")
-      .select("id")
-      .ilike("username", `%${author.trim()}%`)
-      .limit(50)
-      .returns<{ id: string }[]>();
-
     if (aErr) {
       return (
         <Card>
@@ -137,44 +183,46 @@ export default async function CommunityPage({
 
     if (authorIds.length === 0) {
       return (
-        <div className="space-y-4">
-          <Header />
-          <Filters sp={sp} />
-
-          {sp.error ? <p className="text-sm text-destructive">{sp.error}</p> : null}
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">Sin resultados</CardTitle>
-              <CardDescription>
-                No se encontraron autores que coincidan con “{author.trim()}”.
-              </CardDescription>
-            </CardHeader>
-          </Card>
-        </div>
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Sin resultados</CardTitle>
+            <CardDescription>
+              No se encontraron autores que coincidan con “{author.trim()}”.
+            </CardDescription>
+          </CardHeader>
+        </Card>
       );
     }
   }
 
-  // (2) Query base de proyectos públicos
   let query = supabase
     .from("projects")
-    .select("id,owner_user_id,title,description_md,visibility,is_hidden,updated_at,published_at")
+    .select(
+      [
+        "id",
+        "owner_user_id",
+        "title",
+        "description_md",
+        "visibility",
+        "is_hidden",
+        "updated_at",
+        "published_at",
+        "owner:profiles!projects_owner_user_id_fkey(id,username,avatar_url)",
+      ].join(",")
+    )
     .eq("visibility", "public")
-    .eq("is_hidden", false);
+    .eq("is_hidden", false)
+    .range(from, to);
 
-  // Búsqueda por texto
   if (q.trim()) {
     const like = `%${q.trim()}%`;
     query = query.or(`title.ilike.${like},description_md.ilike.${like}`);
   }
 
-  // Filtro por autor (por ids)
   if (authorIds && authorIds.length) {
     query = query.in("owner_user_id", authorIds);
   }
 
-  // Orden
   if (sort === "updated_desc") query = query.order("updated_at", { ascending: false });
   if (sort === "updated_asc") query = query.order("updated_at", { ascending: true });
   if (sort === "published_desc") {
@@ -182,7 +230,7 @@ export default async function CommunityPage({
   }
   if (sort === "title_asc") query = query.order("title", { ascending: true });
 
-  const { data: projectsRaw, error } = await query.returns<ProjectRow[]>();
+  const { data: projectsRaw, error } = await query.returns<ProjectWithOwner[]>();
 
   if (error) {
     return (
@@ -198,24 +246,21 @@ export default async function CommunityPage({
   const projects = projectsRaw ?? [];
   const ids: ProjectId[] = projects.map((p) => p.id);
 
-  // (3) Saber cuáles ya importé (membership)
   const importedSet = new Set<string>();
-
   if (ids.length) {
     const { data: memberships } = await supabase
       .from("project_members")
       .select("project_id")
-      .eq("user_id", userRes.user.id)
+      .eq("user_id", userId)
       .in("project_id", ids)
       .returns<{ project_id: ProjectId }[]>();
 
     for (const m of memberships ?? []) importedSet.add(idToString(m.project_id));
   }
 
-  // (4) Aplicar filtro "show" (en memoria)
   const filtered = projects.filter((p) => {
     const pid = idToString(p.id);
-    const isOwner = p.owner_user_id === userRes.user!.id;
+    const isOwner = p.owner_user_id === userId;
     const already = importedSet.has(pid);
 
     if (show === "mine") return isOwner;
@@ -224,46 +269,18 @@ export default async function CommunityPage({
     return true;
   });
 
-  // (5) Enriquecer con perfiles para mostrar autor (username/avatar)
-  const ownerIds = Array.from(new Set(filtered.map((p) => p.owner_user_id).filter(Boolean)));
-
-  const profilesById = new Map<string, PublicProfile>();
-  if (ownerIds.length) {
-    const { data: profiles, error: pErr } = await supabase
-      .from("profiles")
-      .select("id,username,avatar_url")
-      .in("id", ownerIds)
-      .returns<PublicProfile[]>();
-
-    if (pErr) {
-      return (
-        <Card>
-          <CardHeader>
-            <CardTitle>Error</CardTitle>
-            <CardDescription>{pErr.message}</CardDescription>
-          </CardHeader>
-        </Card>
-      );
-    }
-
-    for (const pr of profiles ?? []) profilesById.set(pr.id, pr);
-  }
+  const hasNextPage = projects.length === PAGE_SIZE;
+  const hasPrevPage = page > 1;
 
   return (
-    <div className="space-y-4">
-      <Header />
-
-      <Filters sp={sp} />
-
-      {sp.error ? <p className="text-sm text-destructive">{sp.error}</p> : null}
-
+    <div className="space-y-3">
       <div className="grid gap-3 sm:grid-cols-2">
         {filtered.map((p) => {
           const pid = idToString(p.id);
-          const isOwner = p.owner_user_id === userRes.user!.id;
+          const isOwner = p.owner_user_id === userId;
           const already = importedSet.has(pid);
 
-          const authorProfile = profilesById.get(p.owner_user_id) ?? null;
+          const authorProfile = p.owner ?? null;
           const authorUsername = authorProfile?.username ?? "usuario";
           const authorAvatar = authorProfile?.avatar_url ?? null;
           const authorInitials = initialsFromUsername(authorProfile?.username ?? null);
@@ -284,31 +301,32 @@ export default async function CommunityPage({
                   {p.description_md ?? ""}
                 </CardDescription>
               </CardHeader>
-                <CardContent className="flex items-center justify-between gap-2">
+
+              <CardContent className="flex items-center justify-between gap-2">
                 <p className="text-xs text-muted-foreground">
-                    Actualizado: {formatDateTimeCL(p.updated_at)}
+                  Actualizado: {formatDateTimeCL(p.updated_at)}
                 </p>
 
                 <div className="flex items-center gap-2">
-                    <ProjectPreviewButton
+                  <ProjectPreviewButton
                     projectId={pid}
                     title={p.title}
                     isOwner={isOwner}
                     alreadyImported={already}
-                    />
+                  />
 
-                    {isOwner || already ? (
+                  {isOwner || already ? (
                     <Button asChild variant="secondary">
-                        <Link href={`/protected/projects/${pid}`}>Abrir</Link>
+                      <Link href={`/protected/projects/${pid}`}>Abrir</Link>
                     </Button>
-                    ) : (
+                  ) : (
                     <form action={importProjectAction}>
-                        <input type="hidden" name="project_id" value={pid} />
-                        <Button type="submit">Importar</Button>
+                      <input type="hidden" name="project_id" value={pid} />
+                      <Button type="submit">Importar</Button>
                     </form>
-                    )}
+                  )}
                 </div>
-                </CardContent>
+              </CardContent>
             </Card>
           );
         })}
@@ -324,6 +342,60 @@ export default async function CommunityPage({
           </Card>
         ) : null}
       </div>
+
+      {/* Simple pagination */}
+      {(hasPrevPage || hasNextPage) && (
+        <div className="flex items-center justify-between">
+          <Button asChild variant="ghost" disabled={!hasPrevPage}>
+            <Link href={buildHref(sp, { page: String(page - 1) })} aria-disabled={!hasPrevPage}>
+              Anterior
+            </Link>
+          </Button>
+
+          <p className="text-xs text-muted-foreground">Página {page}</p>
+
+          <Button asChild variant="ghost" disabled={!hasNextPage}>
+            <Link href={buildHref(sp, { page: String(page + 1) })} aria-disabled={!hasNextPage}>
+              Siguiente
+            </Link>
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function buildHref(sp: SearchParams, overrides: Partial<SearchParams>): string {
+  const params = new URLSearchParams();
+
+  const next: SearchParams = { ...sp, ...overrides };
+
+  if (typeof next.q === "string" && next.q.trim()) params.set("q", next.q);
+  if (typeof next.show === "string" && next.show !== "all") params.set("show", next.show);
+  if (typeof next.sort === "string" && next.sort !== "updated_desc") params.set("sort", next.sort);
+  if (typeof next.author === "string" && next.author.trim()) params.set("author", next.author);
+  if (next.filters === "1") params.set("filters", "1");
+
+  const page = normalizePage(next.page);
+  if (page > 1) params.set("page", String(page));
+
+  const qs = params.toString();
+  return qs ? `/protected/community?${qs}` : "/protected/community";
+}
+
+function ResultsSkeleton() {
+  return (
+    <div className="grid gap-3 sm:grid-cols-2">
+      {Array.from({ length: 6 }).map((_, i) => (
+        <Card key={i} className="h-[152px]">
+          <CardHeader className="space-y-2">
+            <div className="h-4 w-2/3 rounded bg-muted/40" />
+            <div className="h-3 w-1/3 rounded bg-muted/30" />
+            <div className="h-3 w-full rounded bg-muted/20" />
+            <div className="h-3 w-5/6 rounded bg-muted/20" />
+          </CardHeader>
+        </Card>
+      ))}
     </div>
   );
 }
@@ -375,7 +447,6 @@ function Filters(props: { sp: SearchParams }) {
   const hasShow = (show ?? "all") !== "all";
   const hasSort = (sort ?? "updated_desc") !== "updated_desc";
 
-  // Abre el panel si el usuario lo abrió, o si hay filtros activos.
   const open = props.sp.filters === "1" || hasAuthor || hasShow || hasSort;
 
   const chips: Array<React.ReactNode> = [];
@@ -389,9 +460,7 @@ function Filters(props: { sp: SearchParams }) {
           : show === "not_imported"
             ? "Sin importar"
             : "Todos";
-    chips.push(
-      <Chip key="show" icon={<Filter className="h-3.5 w-3.5" />} text={label} />
-    );
+    chips.push(<Chip key="show" icon={<Filter className="h-3.5 w-3.5" />} text={label} />);
   }
 
   if (hasSort) {
@@ -403,24 +472,17 @@ function Filters(props: { sp: SearchParams }) {
           : sort === "title_asc"
             ? "Título: A → Z"
             : "Actualización: recientes";
-    chips.push(
-      <Chip key="sort" icon={<ArrowUpDown className="h-3.5 w-3.5" />} text={label} />
-    );
+    chips.push(<Chip key="sort" icon={<ArrowUpDown className="h-3.5 w-3.5" />} text={label} />);
   }
 
   if (hasAuthor) {
     chips.push(
-      <Chip
-        key="author"
-        icon={<User className="h-3.5 w-3.5" />}
-        text={`Autor: ${author.trim()}`}
-      />
+      <Chip key="author" icon={<User className="h-3.5 w-3.5" />} text={`Autor: ${author.trim()}`} />
     );
   }
 
   return (
     <Card className="overflow-hidden">
-      {/* Header simplificado: sin descripción para reducir ruido visual */}
       <CardHeader className="pb-2">
         <CardTitle className="text-base flex items-center gap-2">
           <Search className="h-4 w-4 text-muted-foreground" />
@@ -430,7 +492,6 @@ function Filters(props: { sp: SearchParams }) {
 
       <CardContent className="space-y-3">
         <form method="get" className="space-y-3">
-          {/* Barra principal (más protagonista) */}
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
             <div className="relative flex-1">
               <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
@@ -444,6 +505,8 @@ function Filters(props: { sp: SearchParams }) {
             </div>
 
             <div className="flex gap-2">
+              <input type="hidden" name="page" value="1" />
+
               <Button type="submit" className="h-11 px-4">
                 <Search className="mr-2 h-4 w-4" />
                 Buscar
@@ -458,7 +521,6 @@ function Filters(props: { sp: SearchParams }) {
             </div>
           </div>
 
-          {/* Chips (más silenciosos) */}
           {(chips.length > 0 || hasQ) && (
             <div className="flex flex-wrap gap-2">
               {hasQ ? (
@@ -468,7 +530,6 @@ function Filters(props: { sp: SearchParams }) {
             </div>
           )}
 
-          {/* Panel filtros: secondary UI (sin borde/fondo/estado textual) */}
           <details className="group" open={open}>
             <summary className="flex cursor-pointer items-center gap-2 text-sm text-muted-foreground hover:text-foreground select-none">
               <SlidersHorizontal className="h-4 w-4" />
@@ -513,7 +574,10 @@ function Filters(props: { sp: SearchParams }) {
               </div>
 
               <div className="sm:col-span-4 space-y-1">
-                <Label htmlFor="author" className="flex items-center gap-2 text-xs text-muted-foreground">
+                <Label
+                  htmlFor="author"
+                  className="flex items-center gap-2 text-xs text-muted-foreground"
+                >
                   <User className="h-4 w-4 text-muted-foreground" />
                   Autor
                 </Label>
@@ -526,7 +590,6 @@ function Filters(props: { sp: SearchParams }) {
                 />
               </div>
 
-              {/* Mantener el panel abierto tras submit si el usuario lo abrió */}
               <input type="hidden" name="filters" value="1" />
             </div>
           </details>
