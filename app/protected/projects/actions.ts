@@ -15,11 +15,13 @@ export async function createProjectAction(formData: FormData): Promise<void> {
   }
 
   const supabase = await createClient();
+
   const { data: userRes, error: userErr } = await supabase.auth.getUser();
   if (userErr || !userRes.user) redirect("/auth/login");
 
   const userId = userRes.user.id;
 
+  // IMPORTANTE: pedir retorno del id
   const { data: project, error: insErr } = await supabase
     .from("projects")
     .insert({
@@ -39,13 +41,23 @@ export async function createProjectAction(formData: FormData): Promise<void> {
     );
   }
 
-  // Asegurar membership owner (idempotente)
-  await supabase
-    .from("project_members")
-    .upsert(
-      { project_id: project.id, user_id: userId, role: "owner" },
-      { onConflict: "project_id,user_id" }
-    );
+  // Opcional:
+  // El owner ya está definido por projects.owner_user_id.
+  //
+  // const { error: memErr } = await supabase
+  //   .from("project_members")
+  //   .upsert(
+  //     { project_id: project.id, user_id: userId, role: "editor" },
+  //     { onConflict: "project_id,user_id" }
+  //   );
+  //
+  // if (memErr) {
+  //   redirect(
+  //     `/protected/projects/new?error=${encodeURIComponent(
+  //       memErr.message
+  //     )}`
+  //   );
+  // }
 
   revalidatePath("/protected/projects");
   redirect(`/protected/projects/${project.id}`);
