@@ -12,7 +12,9 @@ export default function ProtectedLayout({ children }: { children: ReactNode }) {
         <TopNav />
       </Suspense>
 
-      <main className="mx-auto w-full max-w-6xl px-4 py-6">{children}</main>
+      <main className="mx-auto w-full max-w-6xl px-4 py-6 pb-24 sm:pb-6">
+        {children}
+      </main>
 
       <Suspense fallback={null}>
         <PomodoroDock />

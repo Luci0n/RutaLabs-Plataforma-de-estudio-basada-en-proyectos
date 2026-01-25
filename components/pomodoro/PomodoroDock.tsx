@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
 import {
   getPomodoroSettingsAction,
@@ -28,7 +29,6 @@ import {
   Coffee,
   HelpCircle,
   PanelRightClose,
-  PanelRightOpen,
   Pause,
   Play,
   RotateCcw,
@@ -38,7 +38,7 @@ import {
   VolumeX,
 } from "lucide-react";
 
-/* ----------------- Constantes (sin magia) ----------------- */
+/* ----------------- Constantes ----------------- */
 
 const MIN_FOCUS_MINUTES = 1;
 const MAX_FOCUS_MINUTES = 180;
@@ -58,8 +58,10 @@ const TICK_INTERVAL_MS = 250;
 const BROADCAST_DEBOUNCE_MS = 100;
 
 const LAST_USER_KEY = "rutalabs:lastUserId";
-const LS_KEY_OLD = "rutalabs:pomodoro:v1"; // legado (global, inseguro)
+const LS_KEY_OLD = "rutalabs:pomodoro:v1";
 const BC_NAME = "rutalabs:pomodoro:bc";
+
+const SETTINGS_SAVE_DEBOUNCE_MS = 600;
 
 /* ----------------- Dominio ----------------- */
 
@@ -67,7 +69,6 @@ type Phase = "focus" | "short_break" | "long_break";
 
 /**
  * Status local estricto.
- * Si tu DB usa enum, idealmente alinea esos valores a: running | paused | idle.
  */
 type PomodoroStatus = "running" | "paused" | "idle";
 
@@ -459,8 +460,9 @@ const PHASE_META: Record<
     label: string;
     subtitle: string;
     Icon: typeof Brain;
-    ringRunningClass: string; // ej: "stroke-emerald-500"
-    ringPausedClass: string; // ej: "stroke-emerald-400"
+    ringRunningClass: string;
+    ringPausedClass: string;
+    accentBg: string; // fondo tenue para header/tags
     hint: string;
   }
 > = {
@@ -470,6 +472,7 @@ const PHASE_META: Record<
     Icon: Brain,
     ringRunningClass: "stroke-primary",
     ringPausedClass: "stroke-primary/50",
+    accentBg: "bg-primary/10",
     hint: "Trabajo sin distracciones.",
   },
   short_break: {
@@ -478,6 +481,7 @@ const PHASE_META: Record<
     Icon: Coffee,
     ringRunningClass: "stroke-emerald-500",
     ringPausedClass: "stroke-emerald-400",
+    accentBg: "bg-emerald-500/10",
     hint: "Pausa breve: respira, camina, hidrátate.",
   },
   long_break: {
@@ -486,6 +490,7 @@ const PHASE_META: Record<
     Icon: AlarmClock,
     ringRunningClass: "stroke-violet-500",
     ringPausedClass: "stroke-violet-300",
+    accentBg: "bg-violet-500/10",
     hint: "Pausa larga para resetear energía.",
   },
 };
@@ -522,6 +527,9 @@ export function PomodoroDock() {
   // Debounce de broadcast (reduce spam)
   const broadcastQueueRef = useRef<LocalStateV2 | null>(null);
   const broadcastTimerRef = useRef<number | null>(null);
+  const settingsSaveTimerRef = useRef<number | null>(null);
+  const pendingSettingsRef = useRef<{ settings: PomodoroSettings; dockOpen: boolean } | null>(null);
+  const saveSeqRef = useRef(0);
 
   // AudioContext (se cierra al desmontar)
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -560,18 +568,19 @@ export function PomodoroDock() {
     return "Pausado";
   }, [st, remainingSec]);
 
+  const statusTone = useMemo(() => {
+    if (!st) return "muted";
+    if (st.running) return "good";
+    if (remainingSec === 0) return "ready";
+    return "muted";
+  }, [st, remainingSec]);
+
   const longEvery = Math.max(1, st?.settings.cycles_before_long_break ?? 4);
   const longIn = useMemo(() => {
     if (!st) return 0;
     return cyclesUntilLongBreak(st.cycleIndex, longEvery);
   }, [st, longEvery]);
 
-  const collapsedLine2 = useMemo(() => {
-    if (!st) return "";
-    if (st.phase === "long_break") return "Descanso largo";
-    if (longIn === 0) return "Largo: próximo";
-    return `Largo en ${longIn}`;
-  }, [st, longIn]);
 
   const meta = useMemo(() => (st ? PHASE_META[st.phase] : PHASE_META.focus), [st?.phase]);
   const ringRunningClass = meta.ringRunningClass;
@@ -627,6 +636,14 @@ export function PomodoroDock() {
         // no-op
       }
       audioCtxRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (settingsSaveTimerRef.current) window.clearTimeout(settingsSaveTimerRef.current);
+      settingsSaveTimerRef.current = null;
+      pendingSettingsRef.current = null;
     };
   }, []);
 
@@ -1167,12 +1184,12 @@ export function PomodoroDock() {
 
   /* ----------------- Acciones ----------------- */
 
-  async function persistSettings(next: PomodoroSettings, dockOpen = st?.settings.dock_is_open ?? true) {
+  function persistSettings(next: PomodoroSettings, dockOpen = st?.settings.dock_is_open ?? true) {
     if (!st) return;
 
     const normalized = normalizeSettings({ ...next, dock_is_open: dockOpen });
 
-    // Local inmediato
+    // 1) Local inmediato (sin esperar SQL)
     setSt((cur) => {
       if (!cur) return cur;
       const updated: LocalStateV2 = { ...cur, settings: normalized, updatedAtMs: Date.now() };
@@ -1180,16 +1197,36 @@ export function PomodoroDock() {
       return updated;
     });
 
-    const res = await savePomodoroSettingsAction(normalized);
-    if (res.ok) {
-      const saved = normalizeSettings(res.data);
-      setSt((cur) => {
-        if (!cur) return cur;
-        const updated: LocalStateV2 = { ...cur, settings: saved, updatedAtMs: Date.now() };
-        saveLocalStateForUser(cur.userId, updated);
-        return updated;
-      });
-    }
+    // 2) Debounce: coalesce de cambios rápidos
+    pendingSettingsRef.current = { settings: normalized, dockOpen };
+
+    if (settingsSaveTimerRef.current) window.clearTimeout(settingsSaveTimerRef.current);
+
+    settingsSaveTimerRef.current = window.setTimeout(() => {
+      const pending = pendingSettingsRef.current;
+      pendingSettingsRef.current = null;
+      settingsSaveTimerRef.current = null;
+      if (!pending) return;
+
+      const seq = ++saveSeqRef.current;
+
+      void (async () => {
+        const res = await savePomodoroSettingsAction(pending.settings);
+        if (!res.ok) return;
+
+        // Evita aplicar respuestas viejas si hubo otro save después
+        if (seq !== saveSeqRef.current) return;
+
+        const saved = normalizeSettings(res.data);
+
+        setSt((cur) => {
+          if (!cur) return cur;
+          const updated: LocalStateV2 = { ...cur, settings: saved, updatedAtMs: Date.now() };
+          saveLocalStateForUser(cur.userId, updated);
+          return updated;
+        });
+      })();
+    }, SETTINGS_SAVE_DEBOUNCE_MS);
   }
 
   function start() {
@@ -1298,29 +1335,31 @@ export function PomodoroDock() {
   if (!booted) return null;
   if (!st || !userId) return null;
 
+  const phaseChip = `${phaseLabel(st.phase)} · Ciclo ${Math.max(1, st.cycleIndex + 1)}`;
+
   return (
-    <div
-      ref={dockRef}
-      tabIndex={-1}
-      className="fixed bottom-4 right-4 z-50 outline-none"
-      aria-label="Dock Pomodoro"
-    >
-      {!open ? (
-        <div className="w-[312px] max-w-[92vw]">
-          <Card
-            className={cn(
-              "rounded-2xl border bg-card/80 backdrop-blur supports-[backdrop-filter]:bg-card/60 overflow-hidden cursor-pointer",
-              "transition-all duration-300",
-              isHovering && "scale-[1.01] shadow-md"
-            )}
-            onMouseEnter={() => setIsHovering(true)}
-            onMouseLeave={() => setIsHovering(false)}
-            onClick={toggleOpen}
-            role="button"
-            aria-label="Abrir Pomodoro"
-          >
-            <div className="p-3">
-              <div className="flex items-center gap-3">
+    <TooltipProvider delayDuration={120}>
+      <div
+        ref={dockRef}
+        tabIndex={-1}
+        className="fixed bottom-3 right-3 sm:bottom-4 sm:right-4 z-50 outline-none"
+        aria-label="Dock Pomodoro"
+      >
+        {!open ? (
+          <>
+            {/* ----------------- CLOSED: Mobile FAB ----------------- */}
+            <div className="sm:hidden">
+              <button
+                type="button"
+                onClick={toggleOpen}
+                aria-label="Abrir Pomodoro"
+                className={cn(
+                  "h-14 w-14 rounded-2xl border bg-card/85 backdrop-blur-xl supports-[backdrop-filter]:bg-card/60",
+                  "shadow-[0_10px_40px_-20px_rgba(0,0,0,0.45)] ring-1 ring-border/50",
+                  "grid place-items-center"
+                )}
+              >
+                {/* mini timer dentro */}
                 <MiniTimerCircle
                   progress={progress}
                   text={formatMMSS(remainingSec)}
@@ -1328,199 +1367,248 @@ export function PomodoroDock() {
                   ringRunningClass={ringRunningClass}
                   ringPausedClass={ringPausedClass}
                 />
+              </button>
+            </div>
 
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2 min-w-0">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <span className="inline-flex h-8 w-8 items-center justify-center rounded-xl border bg-muted/30">
-                        <meta.Icon className="h-4 w-4" />
-                      </span>
-                      <div className="min-w-0">
-                        <p className="text-sm font-semibold leading-none truncate">Pomodoro</p>
-                        <p className="mt-0.5 text-[12px] text-muted-foreground truncate">
-                          {meta.subtitle} · {collapsedLine2}
-                        </p>
+            {/* ----------------- CLOSED: Desktop mini card ----------------- */}
+            <div className="hidden sm:block w-[260px]">
+              <Card
+                className={cn(
+                  "relative overflow-hidden cursor-pointer rounded-2xl border bg-card/85 backdrop-blur-xl supports-[backdrop-filter]:bg-card/60",
+                  "shadow-[0_10px_40px_-20px_rgba(0,0,0,0.45)] ring-1 ring-border/50",
+                  "transition-all duration-200 motion-reduce:transition-none",
+                  isHovering && "translate-y-[-1px] shadow-[0_14px_52px_-26px_rgba(0,0,0,0.55)]"
+                )}
+                onMouseEnter={() => setIsHovering(true)}
+                onMouseLeave={() => setIsHovering(false)}
+                onClick={toggleOpen}
+                role="button"
+                aria-label="Abrir Pomodoro"
+              >
+                <div className={cn("absolute inset-x-0 top-0 h-1", meta.accentBg)} aria-hidden="true" />
+
+                <div className="p-3">
+                  <div className="flex items-center gap-3">
+                    <MiniTimerCircle
+                      progress={progress}
+                      text={formatMMSS(remainingSec)}
+                      running={st.running}
+                      ringRunningClass={ringRunningClass}
+                      ringPausedClass={ringPausedClass}
+                    />
+
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-sm font-semibold truncate">Pomodoro</p>
+                        <StatusBadge tone={statusTone}>{statusLabel}</StatusBadge>
                       </div>
-                    </div>
-                    <div className="ml-auto flex items-center gap-2">
-                      <Badge>{statusLabel}</Badge>
-                      <HelpPopover />
-                    </div>
-                  </div>
 
-                  <div className="mt-2 flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
-                      <Badge subtle>
-                        {phaseLabel(st.phase)} · Ciclo {Math.max(1, st.cycleIndex + 1)}
-                      </Badge>
+                      <p className="mt-1 text-[12px] text-muted-foreground truncate">
+                        {meta.subtitle} · {phaseLabel(st.phase)}
+                      </p>
                     </div>
 
-                    <div className="flex items-center gap-1">
-                      <IconButton
-                        title={st.running ? "Pausar" : "Iniciar"}
-                        ariaLabel={st.running ? "Pausar" : "Iniciar"}
+                    <div className="shrink-0">
+                      <Button
+                        type="button"
+                        variant={st.running ? "secondary" : "default"}
+                        size="sm"
+                        className="h-9 w-9 rounded-xl p-0"
                         onClick={(e) => {
                           e.stopPropagation();
                           if (st.running) pause();
                           else start();
                         }}
-                        variant="secondary"
-                        size="sm"
-                        className="h-9 w-9 rounded-xl"
+                        aria-label={st.running ? "Pausar" : "Iniciar"}
                       >
                         {st.running ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
-                      </IconButton>
-
-                      <IconButton
-                        title="Abrir panel"
-                        ariaLabel="Abrir panel"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          toggleOpen();
-                        }}
-                        variant="ghost"
-                        size="sm"
-                        className="h-9 w-9 rounded-xl"
-                      >
-                        <PanelRightOpen className="h-4 w-4" />
-                      </IconButton>
+                      </Button>
                     </div>
                   </div>
                 </div>
-              </div>
-
-              <div className="mt-3 rounded-xl border bg-gradient-to-r from-muted/10 to-muted/30 px-3 py-2">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2 text-xs text-muted-foreground min-w-0">
-                    <Sparkles className="h-4 w-4 shrink-0" />
-                    <span className="truncate">{meta.hint}</span>
-                  </div>
-                  <span className="text-[11px] text-muted-foreground whitespace-nowrap">
-                    Largo: {longIn === 0 ? "próximo" : `en ${longIn}`}
-                  </span>
-                </div>
-              </div>
+              </Card>
             </div>
-          </Card>
-        </div>
-      ) : (
-        <div className="w-[420px] max-w-[92vw]">
-          <Card className="rounded-2xl border bg-card/80 backdrop-blur supports-[backdrop-filter]:bg-card/60 shadow-sm overflow-hidden">
-            {/* Header */}
-            <div className="px-4 py-3 border-b">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2 min-w-0">
-                    <span className="inline-flex h-9 w-9 items-center justify-center rounded-xl border bg-muted/30">
-                      <meta.Icon className="h-4 w-4" />
-                    </span>
-                    <div className="min-w-0">
-                      <p className="text-sm font-semibold truncate">Pomodoro</p>
-                      <p className="text-xs text-muted-foreground truncate">
-                        {meta.subtitle} · Ciclo {Math.max(1, st.cycleIndex + 1)}
-                        {st.phase !== "long_break"
-                          ? ` · Largo ${longIn === 0 ? "próximo" : `en ${longIn}`}`
-                          : ""}
-                      </p>
+          </>
+        ) : (
+          /* ----------------- OPEN: responsive width ----------------- */
+          <div className="w-[360px] sm:w-[420px] max-w-[92vw]">
+            <Card
+              className={cn(
+                "relative overflow-hidden rounded-2xl border bg-card/85 backdrop-blur-xl supports-[backdrop-filter]:bg-card/60",
+                "shadow-[0_18px_70px_-44px_rgba(0,0,0,0.75)] ring-1 ring-border/50"
+              )}
+            >
+              {/* Accent bar */}
+              <div className={cn("absolute inset-x-0 top-0 h-1", meta.accentBg)} aria-hidden="true" />
+
+              {/* Header */}
+              <div className="px-4 pt-3.5 pb-3 border-b">
+                <div className="items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span
+                        className={cn(
+                          "inline-flex h-9 w-9 items-center justify-center rounded-xl border",
+                          meta.accentBg
+                        )}
+                      >
+                        <meta.Icon className="h-4 w-4" />
+                      </span>
+
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <p className="text-sm font-semibold truncate">Pomodoro</p>
+                          <StatusDot tone={statusTone} />
+                        </div>
+
+                        <p className="text-xs text-muted-foreground truncate">
+                          {meta.subtitle} · Ciclo {Math.max(1, st.cycleIndex + 1)}
+                          {st.phase !== "long_break"
+                            ? ` · Largo ${longIn === 0 ? "próximo" : `en ${longIn}`}`
+                            : ""}
+                        </p>
+                      </div>
+
+                      <div className="ml-auto flex items-center gap-2">
+                        <StatusBadge tone={statusTone}>{statusLabel}</StatusBadge>
+                        <HelpPopover />
+
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              className="h-9 w-9 rounded-xl p-0"
+                              onClick={toggleOpen}
+                              aria-label="Ocultar panel"
+                            >
+                              <PanelRightClose className="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent side="bottom">Ocultar</TooltipContent>
+                        </Tooltip>
+                      </div>
                     </div>
-                    <div className="ml-auto flex items-center gap-2">
-                      <Badge>{statusLabel}</Badge>
+
+                    <div className="mt-2 flex items-center gap-2">
+                      <Badge subtle>{phaseChip}</Badge>
+                      <Badge subtle>{Math.round(progress * 100)}% completado</Badge>
                     </div>
                   </div>
                 </div>
+              </div>
 
-                <div className="flex items-center gap-2">
-                  <HelpPopover />
-                  <IconButton
-                    title="Ocultar panel"
-                    ariaLabel="Ocultar panel"
-                    onClick={toggleOpen}
+              {/* Body */}
+              <div className="px-4 py-4 space-y-4">
+                <div className="flex items-center justify-center pt-1">
+                  <TimerCircle
+                    progress={progress}
+                    time={formatMMSS(remainingSec)}
+                    subtitle={`${phaseLabel(st.phase)} · ${statusLabel}`}
+                    running={st.running}
+                    ringRunningClass={ringRunningClass}
+                    ringPausedClass={ringPausedClass}
+                    ariaLabel={`${formatMMSS(remainingSec)} restantes en ${phaseLabel(st.phase)}. Estado: ${statusLabel}.`}
+                  />
+                </div>
+
+                {/* Acciones primarias */}
+                <div className="grid grid-cols-2 gap-2">
+                  <Button
+                    type="button"
+                    onClick={start}
+                    disabled={st.running}
+                    className="h-11 gap-2 rounded-xl"
+                  >
+                    <Play className="h-4 w-4" />
+                    Iniciar
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    onClick={pause}
+                    disabled={!st.running}
+                    className="h-11 gap-2 rounded-xl"
+                  >
+                    <Pause className="h-4 w-4" />
+                    Pausar
+                  </Button>
+                </div>
+
+                {/* Acciones secundarias */}
+                <div className="flex items-center justify-between gap-2">
+                  <Button
+                    type="button"
                     variant="ghost"
                     size="sm"
-                    className="h-9 w-9 rounded-xl"
+                    className="gap-2 rounded-xl"
+                    onClick={() => restartPhase(st.phase)}
                   >
-                    <PanelRightClose className="h-4 w-4" />
-                  </IconButton>
+                    <RotateCcw className="h-4 w-4" />
+                    Reiniciar fase
+                  </Button>
+
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="gap-2 rounded-xl"
+                    onClick={restartAll}
+                  >
+                    <RotateCcw className="h-4 w-4" />
+                    Reiniciar todo
+                  </Button>
                 </div>
-              </div>
-            </div>
 
-            {/* Body */}
-            <div className="px-4 py-4 space-y-4">
-              <div className="flex items-center justify-center pt-1">
-                <TimerCircle
-                  progress={progress}
-                  time={formatMMSS(remainingSec)}
-                  subtitle={`${phaseLabel(st.phase)} · ${statusLabel}`}
-                  running={st.running}
-                  ringRunningClass={ringRunningClass}
-                  ringPausedClass={ringPausedClass}
-                  ariaLabel={`${formatMMSS(remainingSec)} restantes en ${phaseLabel(st.phase)}. Estado: ${statusLabel}.`}
+                {/* Tabs de fase */}
+                <div className="rounded-2xl border bg-muted/10 p-1 grid grid-cols-3 gap-1">
+                  <PhaseSegment
+                    active={st.phase === "focus"}
+                    label="Foco"
+                    icon={<Brain className="h-4 w-4" />}
+                    onClick={() => switchPhase("focus")}
+                  />
+                  <PhaseSegment
+                    active={st.phase === "short_break"}
+                    label="Descanso"
+                    icon={<Coffee className="h-4 w-4" />}
+                    onClick={() => switchPhase("short_break")}
+                  />
+                  <PhaseSegment
+                    active={st.phase === "long_break"}
+                    label="Largo"
+                    icon={<AlarmClock className="h-4 w-4" />}
+                    onClick={() => switchPhase("long_break")}
+                  />
+                </div>
+
+                {/* Hint pro */}
+                <div className="rounded-2xl border bg-muted/10 px-3 py-2.5">
+                  <div className="flex items-start gap-2">
+                    <Sparkles className="h-4 w-4 mt-0.5 text-muted-foreground" />
+                    <div className="min-w-0">
+                      <p className="text-xs text-muted-foreground leading-relaxed">
+                        <span className="font-medium text-foreground/90">{meta.hint}</span>{" "}
+                        {st.phase === "focus"
+                          ? "Define un objetivo mínimo y medible para enfocarte."
+                          : "Aléjate de la pantalla y toma un descanso."}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Settings */}
+                <SettingsPanel
+                  settings={st.settings}
+                  onChange={(next, dockOpen) => void persistSettings(next, dockOpen)}
                 />
               </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <Button type="button" onClick={start} disabled={st.running} className="h-11 gap-2">
-                  <Play className="h-4 w-4" />
-                  Iniciar
-                </Button>
-                <Button
-                  type="button"
-                  variant="secondary"
-                  onClick={pause}
-                  disabled={!st.running}
-                  className="h-11 gap-2"
-                >
-                  <Pause className="h-4 w-4" />
-                  Pausar
-                </Button>
-              </div>
-
-              <div className="flex items-center justify-between gap-2">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className="gap-2"
-                  onClick={() => restartPhase(st.phase)}
-                >
-                  <RotateCcw className="h-4 w-4" />
-                  Reiniciar fase
-                </Button>
-
-                <Button type="button" variant="ghost" size="sm" className="gap-2" onClick={restartAll}>
-                  <RotateCcw className="h-4 w-4" />
-                  Reiniciar todo
-                </Button>
-              </div>
-
-              <div className="rounded-2xl border bg-muted/15 p-1 grid grid-cols-3 gap-1">
-                <PhaseSegment
-                  active={st.phase === "focus"}
-                  label="Foco"
-                  icon={<Brain className="h-4 w-4" />}
-                  onClick={() => switchPhase("focus")}
-                />
-                <PhaseSegment
-                  active={st.phase === "short_break"}
-                  label="Descanso"
-                  icon={<Coffee className="h-4 w-4" />}
-                  onClick={() => switchPhase("short_break")}
-                />
-                <PhaseSegment
-                  active={st.phase === "long_break"}
-                  label="Largo"
-                  icon={<AlarmClock className="h-4 w-4" />}
-                  onClick={() => switchPhase("long_break")}
-                />
-              </div>
-
-              <SettingsPanel settings={st.settings} onChange={(next, dockOpen) => void persistSettings(next, dockOpen)} />
-            </div>
-          </Card>
-        </div>
-      )}
-    </div>
+            </Card>
+          </div>
+        )}
+      </div>
+    </TooltipProvider>
   );
 }
 
@@ -1530,7 +1618,7 @@ export function PomodoroDock() {
  * Indicador circular basado en SVG.
  * Ventajas:
  * - Animación suave vía transición CSS (stroke-dashoffset)
- * - Colores con clases Tailwind (ej: stroke-emerald-500)
+ * - Colores con clases Tailwind (stroke-emerald-500, etc.)
  * - Mejor accesibilidad (aria-live)
  */
 function CircleProgress(props: {
@@ -1568,7 +1656,7 @@ function CircleProgress(props: {
           fill="none"
           className="stroke-muted"
           strokeWidth={props.stroke}
-          opacity={0.5}
+          opacity={0.4}
         />
         {/* Progress */}
         <circle
@@ -1585,14 +1673,14 @@ function CircleProgress(props: {
         />
       </svg>
 
-      <div className="relative grid place-items-center rounded-full bg-card border w-[calc(100%-20px)] h-[calc(100%-20px)] shadow-inner">
+      <div className="relative grid place-items-center rounded-full bg-card/90 border w-[calc(100%-20px)] h-[calc(100%-20px)] shadow-inner">
         {props.children}
       </div>
 
       {props.running ? (
         <div
           className="absolute inset-0 rounded-full"
-          style={{ boxShadow: "0 0 0 2px rgba(255,255,255,0.06), 0 0 28px rgba(0,0,0,0.18)" }}
+          style={{ boxShadow: "0 0 0 2px rgba(255,255,255,0.05), 0 0 30px rgba(0,0,0,0.18)" }}
           aria-hidden="true"
         />
       ) : null}
@@ -1611,7 +1699,7 @@ function TimerCircle(props: {
 }) {
   return (
     <CircleProgress
-      size={184}
+      size={188}
       stroke={10}
       progress={props.progress}
       running={props.running}
@@ -1635,9 +1723,8 @@ function MiniTimerCircle(props: {
   ringRunningClass: string;
   ringPausedClass: string;
 }) {
-  const size = 46;
+  const size = 48;
 
-  // Mini: usamos el mismo componente, pero un contenido más compacto
   return (
     <div className="relative">
       <CircleProgress
@@ -1653,7 +1740,10 @@ function MiniTimerCircle(props: {
       </CircleProgress>
 
       <div
-        className={cn("absolute -bottom-1 -right-1 h-3 w-3 rounded-full border bg-card", props.running && "animate-pulse")}
+        className={cn(
+          "absolute -bottom-1 -right-1 h-3 w-3 rounded-full border bg-card shadow-sm",
+          props.running && "animate-pulse"
+        )}
         aria-hidden="true"
       />
     </div>
@@ -1666,7 +1756,10 @@ function PhaseSegment(props: { active: boolean; label: string; icon: ReactNode; 
       type="button"
       variant={props.active ? "secondary" : "ghost"}
       size="sm"
-      className="h-10 rounded-xl justify-center gap-2"
+      className={cn(
+        "h-10 rounded-xl justify-center gap-2",
+        "transition-colors motion-reduce:transition-none"
+      )}
       onClick={props.onClick}
       aria-pressed={props.active}
     >
@@ -1688,7 +1781,10 @@ function TogglePill(props: {
       type="button"
       variant={props.value ? "secondary" : "ghost"}
       size="sm"
-      className="rounded-full h-9 gap-2"
+      className={cn(
+        "rounded-full h-9 gap-2",
+        "transition-colors motion-reduce:transition-none"
+      )}
       onClick={props.onToggle}
       aria-pressed={props.value}
     >
@@ -1704,7 +1800,7 @@ function Badge(props: { children: ReactNode; subtle?: boolean }) {
     <span
       className={cn(
         "text-[10px] px-2 py-0.5 rounded-full border whitespace-nowrap",
-        props.subtle ? "bg-muted/15 text-muted-foreground" : "bg-muted/35 text-muted-foreground"
+        props.subtle ? "bg-muted/10 text-muted-foreground" : "bg-muted/25 text-muted-foreground"
       )}
     >
       {props.children}
@@ -1712,27 +1808,29 @@ function Badge(props: { children: ReactNode; subtle?: boolean }) {
   );
 }
 
-function IconButton(props: {
-  children: ReactNode;
-  onClick: (e: React.MouseEvent<HTMLButtonElement>) => void;
-  title: string;
-  ariaLabel: string;
-  variant?: "default" | "secondary" | "ghost";
-  size?: "sm" | "default";
-  className?: string;
-}) {
+function StatusDot(props: { tone: "good" | "ready" | "muted" }) {
+  const cls =
+    props.tone === "good"
+      ? "bg-emerald-500/90"
+      : props.tone === "ready"
+      ? "bg-primary/90"
+      : "bg-muted-foreground/50";
+
+  return <span className={cn("inline-block h-2 w-2 rounded-full", cls)} aria-hidden="true" />;
+}
+
+function StatusBadge(props: { children: ReactNode; tone: "good" | "ready" | "muted" }) {
+  const cls =
+    props.tone === "good"
+      ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border-emerald-500/20"
+      : props.tone === "ready"
+      ? "bg-primary/10 text-primary border-primary/20"
+      : "bg-muted/20 text-muted-foreground border-border/60";
+
   return (
-    <Button
-      type="button"
-      variant={props.variant ?? "ghost"}
-      size={props.size ?? "sm"}
-      className={props.className}
-      onClick={props.onClick}
-      title={props.title}
-      aria-label={props.ariaLabel}
-    >
+    <span className={cn("text-[10px] px-2 py-0.5 rounded-full border whitespace-nowrap", cls)}>
       {props.children}
-    </Button>
+    </span>
   );
 }
 
@@ -1761,7 +1859,7 @@ function PomodoroHelp() {
 
       <ul className="text-xs text-muted-foreground space-y-2">
         <li className="flex gap-2">
-          <span className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-md border bg-muted/30">
+          <span className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-md border bg-muted/20">
             <Play className="h-3 w-3" />
           </span>
           <span>
@@ -1770,7 +1868,7 @@ function PomodoroHelp() {
           </span>
         </li>
         <li className="flex gap-2">
-          <span className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-md border bg-muted/30">
+          <span className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-md border bg-muted/20">
             <Coffee className="h-3 w-3" />
           </span>
           <span>
@@ -1779,7 +1877,7 @@ function PomodoroHelp() {
           </span>
         </li>
         <li className="flex gap-2">
-          <span className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-md border bg-muted/30">
+          <span className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-md border bg-muted/20">
             <RotateCcw className="h-3 w-3" />
           </span>
           <span>
@@ -1788,18 +1886,18 @@ function PomodoroHelp() {
           </span>
         </li>
         <li className="flex gap-2">
-          <span className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-md border bg-muted/30">
+          <span className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-md border bg-muted/20">
             <Settings2 className="h-3 w-3" />
           </span>
           <span>
-            Este widget se <b className="text-foreground">sincroniza</b> entre pestañas y navegadores (si estás conectado).
+            Se <b className="text-foreground">sincroniza</b> entre pestañas y navegadores (si estás conectado).
           </span>
         </li>
       </ul>
 
-      <div className="rounded-xl border bg-muted/15 px-3 py-2">
+      <div className="rounded-xl border bg-muted/10 px-3 py-2">
         <p className="text-xs text-muted-foreground">
-          Sugerencia: durante el foco, define 1 objetivo pequeño y medible. Al iniciar el descanso, aléjate de la pantalla.
+          Sugerencia: durante el foco, define 1 objetivo pequeño y medible. En el descanso, aléjate de la pantalla.
         </p>
       </div>
     </div>
@@ -1812,21 +1910,41 @@ function Field(props: {
   suffix?: string;
   value: number;
   onChange: (value: number) => void;
+  min?: number;
+  max?: number;
 }) {
   const id = useId();
+
   return (
     <div className="space-y-1">
-      <label htmlFor={id} className="text-xs text-muted-foreground flex items-center gap-2">
-        <span className="inline-flex h-6 w-6 items-center justify-center rounded-lg border bg-muted/20">{props.icon}</span>
-        <span className="font-medium text-foreground/90">{props.label}</span>
-        {props.suffix ? <span className="opacity-70">({props.suffix})</span> : null}
+      <label htmlFor={id} className="text-xs text-muted-foreground flex items-center justify-between gap-2">
+        <span className="flex items-center gap-2 min-w-0">
+          <span className="inline-flex h-6 w-6 items-center justify-center rounded-lg border bg-muted/15">
+            {props.icon}
+          </span>
+          <span className="font-medium text-foreground/90 truncate">{props.label}</span>
+          {props.suffix ? <span className="opacity-70">({props.suffix})</span> : null}
+        </span>
+
+        {typeof props.min === "number" && typeof props.max === "number" ? (
+          <span className="text-[10px] text-muted-foreground/80 whitespace-nowrap">
+            {props.min}–{props.max}
+          </span>
+        ) : null}
       </label>
+
       <Input
         id={id}
         type="number"
+        inputMode="numeric"
         value={props.value}
+        min={props.min}
+        max={props.max}
         onChange={(e) => props.onChange(Number(e.target.value))}
-        className="h-10 rounded-xl"
+        className={cn(
+          "h-10 rounded-xl",
+          "bg-card/70 focus-visible:ring-2 focus-visible:ring-ring/40"
+        )}
       />
     </div>
   );
@@ -1842,14 +1960,17 @@ function SettingsPanel(props: {
     <div className="rounded-2xl border overflow-hidden">
       <button
         type="button"
-        className="w-full px-3 py-2 flex items-center justify-between bg-muted/10 hover:bg-muted/15 transition"
+        className={cn(
+          "w-full px-3 py-2.5 flex items-center justify-between",
+          "bg-muted/10 hover:bg-muted/15 transition motion-reduce:transition-none"
+        )}
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
       >
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 min-w-0">
           <Settings2 className="h-4 w-4" />
           <span className="text-sm font-semibold">Ajustes</span>
-          <span className="text-xs text-muted-foreground">Personaliza tiempos y alertas</span>
+          <span className="text-xs text-muted-foreground truncate">Personaliza tiempos y alertas</span>
         </div>
         {open ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
       </button>
@@ -1862,9 +1983,14 @@ function SettingsPanel(props: {
               suffix="min"
               icon={<Brain className="h-4 w-4" />}
               value={props.settings.focus_minutes}
+              min={MIN_FOCUS_MINUTES}
+              max={MAX_FOCUS_MINUTES}
               onChange={(v) =>
                 props.onChange(
-                  { ...props.settings, focus_minutes: clampInt(v, MIN_FOCUS_MINUTES, MAX_FOCUS_MINUTES, props.settings.focus_minutes) },
+                  {
+                    ...props.settings,
+                    focus_minutes: clampInt(v, MIN_FOCUS_MINUTES, MAX_FOCUS_MINUTES, props.settings.focus_minutes),
+                  },
                   props.settings.dock_is_open ?? true
                 )
               }
@@ -1874,11 +2000,18 @@ function SettingsPanel(props: {
               suffix="min"
               icon={<Coffee className="h-4 w-4" />}
               value={props.settings.short_break_minutes}
+              min={MIN_SHORT_BREAK_MINUTES}
+              max={MAX_SHORT_BREAK_MINUTES}
               onChange={(v) =>
                 props.onChange(
                   {
                     ...props.settings,
-                    short_break_minutes: clampInt(v, MIN_SHORT_BREAK_MINUTES, MAX_SHORT_BREAK_MINUTES, props.settings.short_break_minutes),
+                    short_break_minutes: clampInt(
+                      v,
+                      MIN_SHORT_BREAK_MINUTES,
+                      MAX_SHORT_BREAK_MINUTES,
+                      props.settings.short_break_minutes
+                    ),
                   },
                   props.settings.dock_is_open ?? true
                 )
@@ -1889,11 +2022,18 @@ function SettingsPanel(props: {
               suffix="min"
               icon={<AlarmClock className="h-4 w-4" />}
               value={props.settings.long_break_minutes}
+              min={MIN_LONG_BREAK_MINUTES}
+              max={MAX_LONG_BREAK_MINUTES}
               onChange={(v) =>
                 props.onChange(
                   {
                     ...props.settings,
-                    long_break_minutes: clampInt(v, MIN_LONG_BREAK_MINUTES, MAX_LONG_BREAK_MINUTES, props.settings.long_break_minutes),
+                    long_break_minutes: clampInt(
+                      v,
+                      MIN_LONG_BREAK_MINUTES,
+                      MAX_LONG_BREAK_MINUTES,
+                      props.settings.long_break_minutes
+                    ),
                   },
                   props.settings.dock_is_open ?? true
                 )
@@ -1904,11 +2044,18 @@ function SettingsPanel(props: {
               suffix="ciclos"
               icon={<Clock className="h-4 w-4" />}
               value={props.settings.cycles_before_long_break}
+              min={MIN_CYCLES_BEFORE_LONG}
+              max={MAX_CYCLES_BEFORE_LONG}
               onChange={(v) =>
                 props.onChange(
                   {
                     ...props.settings,
-                    cycles_before_long_break: clampInt(v, MIN_CYCLES_BEFORE_LONG, MAX_CYCLES_BEFORE_LONG, props.settings.cycles_before_long_break),
+                    cycles_before_long_break: clampInt(
+                      v,
+                      MIN_CYCLES_BEFORE_LONG,
+                      MAX_CYCLES_BEFORE_LONG,
+                      props.settings.cycles_before_long_break
+                    ),
                   },
                   props.settings.dock_is_open ?? true
                 )
@@ -1949,7 +2096,7 @@ function SettingsPanel(props: {
           <div className="rounded-xl border bg-muted/10 px-3 py-2">
             <p className="text-[11px] text-muted-foreground leading-relaxed">
               Los cambios se guardan automáticamente. Si estás en medio de un conteo, los nuevos minutos aplican al
-              reiniciar/cambiar de fase.
+              reiniciar o cambiar de fase.
             </p>
           </div>
         </div>
