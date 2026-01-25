@@ -24,6 +24,7 @@ import {
   X,
   ArrowRight,
 } from "lucide-react";
+
 import { formatDateTimeCL } from "@/lib/datetime";
 
 export type HomeDashboardData = {
@@ -52,10 +53,7 @@ export type HomeDashboardData = {
 
 type HelpTabKey = "rutalabs" | "pomodoro" | "active_recall" | "projects" | "rules";
 
-const TAB_META: Record<
-  HelpTabKey,
-  { label: string; icon: ReactNode; desc: string }
-> = {
+const TAB_META: Record<HelpTabKey, { label: string; icon: ReactNode; desc: string }> = {
   rutalabs: {
     label: "RutaLabs",
     icon: <Sparkles className="h-4 w-4" />,
@@ -82,6 +80,47 @@ const TAB_META: Record<
     desc: "Límites y buenas prácticas.",
   },
 };
+
+function cx(...v: Array<string | false | null | undefined>) {
+  return v.filter(Boolean).join(" ");
+}
+
+/* ---------- Modern surface primitives ---------- */
+
+function FancyCard(props: { children: ReactNode; className?: string }) {
+  return (
+    <Card
+      className={cx(
+        "rounded-2xl border bg-card/85 backdrop-blur supports-[backdrop-filter]:bg-card/70",
+        "ring-1 ring-black/5 dark:ring-white/5",
+        "shadow-sm",
+        "transition-all motion-safe:duration-200",
+        "motion-safe:hover:-translate-y-[1px] motion-safe:hover:shadow-md",
+        props.className
+      )}
+    >
+      {props.children}
+    </Card>
+  );
+}
+
+function FancyButton(props: React.ComponentProps<typeof Button>) {
+  const { className, ...rest } = props;
+  return (
+    <Button
+      {...rest}
+      className={cx(
+        "rounded-2xl",
+        "transition-all motion-safe:duration-200",
+        "motion-safe:hover:-translate-y-[1px] motion-safe:hover:shadow-md",
+        "active:translate-y-0",
+        className
+      )}
+    />
+  );
+}
+
+/* ---------- Page ---------- */
 
 export function HomeClient(props: { data: HomeDashboardData }) {
   const d = props.data;
@@ -116,11 +155,11 @@ export function HomeClient(props: { data: HomeDashboardData }) {
       </div>
 
       {/* Intro / RutaLabs */}
-      <Card className="rounded-2xl border bg-card/80 backdrop-blur supports-[backdrop-filter]:bg-card/60 shadow-sm overflow-hidden">
+      <FancyCard className="overflow-hidden">
         <CardHeader className="flex flex-row items-start justify-between gap-3">
           <div className="min-w-0 space-y-1">
             <div className="flex items-center gap-2">
-              <span className="inline-flex h-9 w-9 items-center justify-center rounded-xl border bg-muted/30">
+              <span className="inline-flex h-9 w-9 items-center justify-center rounded-xl border bg-muted/25">
                 <Sparkles className="h-4 w-4" />
               </span>
               <div className="min-w-0">
@@ -139,8 +178,8 @@ export function HomeClient(props: { data: HomeDashboardData }) {
               body={
                 <div className="space-y-2">
                   <p>
-                    Este dashboard es un resumen rápido: crea proyectos, ve lo que toca hoy y retoma lo
-                    último que estabas trabajando.
+                    Este dashboard es un resumen rápido: crea proyectos, ve lo que toca hoy y retoma lo último
+                    que estabas trabajando.
                   </p>
                   <p className="text-[11px] text-muted-foreground">
                     Para una explicación completa, abre la guía por pestañas.
@@ -149,7 +188,7 @@ export function HomeClient(props: { data: HomeDashboardData }) {
               }
             />
 
-            <Button
+            <FancyButton
               type="button"
               size="lg"
               className="h-11 px-5 gap-2"
@@ -162,13 +201,13 @@ export function HomeClient(props: { data: HomeDashboardData }) {
             >
               <BookOpen className="h-4 w-4" />
               Abrir guía
-            </Button>
+            </FancyButton>
           </div>
         </CardHeader>
 
         <CardContent className="space-y-3">
           <div className="grid gap-2 sm:grid-cols-3">
-            <Button asChild className="justify-between gap-2 rounded-2xl h-11">
+            <FancyButton asChild className="justify-between gap-2 h-11">
               <Link href="/protected/projects/new">
                 <span className="flex items-center gap-2">
                   <Plus className="h-4 w-4" />
@@ -176,9 +215,9 @@ export function HomeClient(props: { data: HomeDashboardData }) {
                 </span>
                 <ArrowRight className="h-4 w-4 opacity-70" />
               </Link>
-            </Button>
+            </FancyButton>
 
-            <Button asChild variant="secondary" className="justify-between gap-2 rounded-2xl h-11">
+            <FancyButton asChild variant="secondary" className="justify-between gap-2 h-11">
               <Link href="/protected/agenda">
                 <span className="flex items-center gap-2">
                   <ListTodo className="h-4 w-4" />
@@ -186,9 +225,9 @@ export function HomeClient(props: { data: HomeDashboardData }) {
                 </span>
                 <ArrowRight className="h-4 w-4 opacity-70" />
               </Link>
-            </Button>
+            </FancyButton>
 
-            <Button asChild variant="ghost" className="justify-between gap-2 rounded-2xl h-11">
+            <FancyButton asChild variant="ghost" className="justify-between gap-2 h-11 hover:bg-muted/25">
               <Link href="/protected/community">
                 <span className="flex items-center gap-2">
                   <Compass className="h-4 w-4" />
@@ -196,7 +235,7 @@ export function HomeClient(props: { data: HomeDashboardData }) {
                 </span>
                 <ArrowRight className="h-4 w-4 opacity-60" />
               </Link>
-            </Button>
+            </FancyButton>
           </div>
 
           <div className="rounded-2xl border bg-muted/10 px-4 py-3">
@@ -206,34 +245,31 @@ export function HomeClient(props: { data: HomeDashboardData }) {
                 <b className="text-foreground">Agenda</b> para priorizar,{" "}
                 <b className="text-foreground">Tarjetas</b> para entrenar memoria.
               </p>
-              <span className="text-xs text-muted-foreground">
-                Consejo: convierte una idea por tarjeta.
-              </span>
+              <span className="text-xs text-muted-foreground">Consejo: convierte una idea por tarjeta.</span>
             </div>
           </div>
         </CardContent>
-      </Card>
-    {/* Main grid */}
+      </FancyCard>
+
+      {/* Main grid */}
       <div className="grid gap-4 lg:grid-cols-3">
         <div className="space-y-4 lg:col-span-3">
           {/* Proyectos recientes */}
-          <Card className="rounded-2xl border bg-card/80 backdrop-blur supports-[backdrop-filter]:bg-card/60 shadow-sm">
-            <CardHeader className="flex flex-row items-start justify-between gap-3">
+          <FancyCard>
+            <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
               <div className="min-w-0 space-y-1">
                 <div className="flex items-center gap-2">
-                  <span className="inline-flex h-9 w-9 items-center justify-center rounded-xl border bg-muted/30">
+                  <span className="inline-flex h-9 w-9 items-center justify-center rounded-xl border bg-muted/25">
                     <History className="h-4 w-4" />
                   </span>
                   <div className="min-w-0">
                     <CardTitle className="truncate">Proyectos recientes</CardTitle>
-                    <CardDescription className="truncate">
-                      Retoma lo último que tocaste.
-                    </CardDescription>
+                    <CardDescription className="truncate">Retoma lo último que tocaste.</CardDescription>
                   </div>
                 </div>
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2 sm:justify-end">
                 <HelpTip
                   label="Ayuda: Proyectos recientes"
                   title="¿Qué aparece aquí?"
@@ -249,12 +285,12 @@ export function HomeClient(props: { data: HomeDashboardData }) {
                     </div>
                   }
                 />
-                <Button asChild variant="ghost" className="gap-2">
+                <FancyButton asChild variant="ghost" className="gap-2 hover:bg-muted/25">
                   <Link href="/protected/projects">
                     Ver todos
                     <ArrowRight className="h-4 w-4 opacity-60" />
                   </Link>
-                </Button>
+                </FancyButton>
               </div>
             </CardHeader>
 
@@ -265,18 +301,18 @@ export function HomeClient(props: { data: HomeDashboardData }) {
                   desc="Crea uno o importa desde Comunidad."
                   actions={
                     <div className="flex flex-wrap gap-2">
-                      <Button asChild className="gap-2">
+                      <FancyButton asChild className="gap-2">
                         <Link href="/protected/projects/new">
                           <Plus className="h-4 w-4" />
                           Crear proyecto
                         </Link>
-                      </Button>
-                      <Button asChild variant="secondary" className="gap-2">
+                      </FancyButton>
+                      <FancyButton asChild variant="secondary" className="gap-2">
                         <Link href="/protected/community">
                           <Compass className="h-4 w-4" />
                           Ir a Comunidad
                         </Link>
-                      </Button>
+                      </FancyButton>
                     </div>
                   }
                 />
@@ -285,43 +321,47 @@ export function HomeClient(props: { data: HomeDashboardData }) {
                   {d.recentProjects.map((p) => (
                     <div
                       key={p.project_id}
-                      className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border bg-muted/5 p-3"
+                      className={cx(
+                        "flex flex-wrap items-center justify-between gap-3 rounded-2xl border p-3",
+                        "bg-muted/5 transition-colors",
+                        "hover:bg-muted/10"
+                      )}
                     >
                       <div className="min-w-0">
                         <div className="flex items-center gap-2 min-w-0">
                           <p className="text-sm font-semibold truncate">{p.title}</p>
                           <Chip subtle>{roleLabel(p.role)}</Chip>
                         </div>
-                            <p className="mt-0.5 text-xs text-muted-foreground truncate">
-                            Última actualización: {formatDateTimeCL(p.updated_at)}
-                            </p>
+                        <p className="mt-0.5 text-xs text-muted-foreground truncate">
+                          Última actualización: {formatDateTimeCL(p.updated_at)}
+                        </p>
                       </div>
 
                       <div className="flex flex-wrap gap-2">
-                        <Button asChild variant="secondary" className="gap-2">
+                        <FancyButton asChild variant="secondary" className="gap-2">
                           <Link href={`/protected/projects/${encodeURIComponent(p.project_id)}?tab=view`}>
                             Abrir
                             <ArrowRight className="h-4 w-4 opacity-70" />
                           </Link>
-                        </Button>
-                        <Button asChild variant="ghost" className="gap-2">
+                        </FancyButton>
+                        <FancyButton asChild variant="ghost" className="gap-2 hover:bg-muted/25">
                           <Link href={`/protected/projects/${encodeURIComponent(p.project_id)}?tab=edit`}>
                             <Pencil className="h-4 w-4" />
                             Editar
                           </Link>
-                        </Button>
+                        </FancyButton>
                       </div>
                     </div>
                   ))}
                 </div>
               )}
             </CardContent>
-          </Card>
+          </FancyCard>
         </div>
-
       </div>
+
       {/* Resumen de hoy */}
-      <Card className="rounded-2xl border bg-card/80 backdrop-blur supports-[backdrop-filter]:bg-card/60 shadow-sm">
+      <FancyCard>
         <CardHeader className="flex flex-row items-start justify-between gap-3">
           <div className="min-w-0 space-y-1">
             <CardTitle>Resumen de hoy</CardTitle>
@@ -366,21 +406,21 @@ export function HomeClient(props: { data: HomeDashboardData }) {
           </div>
 
           <div className="flex flex-wrap gap-2">
-            <Button asChild variant="secondary" className="gap-2">
+            <FancyButton asChild variant="secondary" className="gap-2">
               <Link href="/protected/agenda">
                 <CalendarClock className="h-4 w-4" />
                 Abrir agenda
               </Link>
-            </Button>
-            <Button asChild variant="secondary" className="gap-2">
+            </FancyButton>
+            <FancyButton asChild variant="secondary" className="gap-2">
               <Link href="/protected/projects">
                 <FolderKanban className="h-4 w-4" />
                 Abrir proyectos
               </Link>
-            </Button>
+            </FancyButton>
           </div>
         </CardContent>
-      </Card>
+      </FancyCard>
 
       {/* Overlay de ayuda (tabs) */}
       <HelpOverlay
@@ -403,14 +443,22 @@ function HelpTip(props: { label: string; title: string; body: ReactNode }) {
           type="button"
           variant="ghost"
           size="sm"
-          className="h-9 w-9 p-0 rounded-xl"
+          className="h-9 w-9 p-0 rounded-xl hover:bg-muted/25"
           aria-label={props.label}
           title={props.label}
         >
           <HelpCircle className="h-4 w-4" />
         </Button>
       </PopoverTrigger>
-      <PopoverContent side="top" align="end" className="w-80">
+      <PopoverContent
+        side="top"
+        align="end"
+        className={cx(
+          "w-80 rounded-2xl border",
+          "bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/80",
+          "shadow-md"
+        )}
+      >
         <div className="space-y-2">
           <p className="text-sm font-semibold">{props.title}</p>
           <div className="text-xs text-muted-foreground leading-relaxed">{props.body}</div>
@@ -424,7 +472,16 @@ function HelpTip(props: { label: string; title: string; body: ReactNode }) {
 
 function StatTile(props: { icon: ReactNode; label: string; value: string; hint: string }) {
   return (
-    <div className="rounded-2xl border bg-muted/5 p-4">
+    <div
+      className={cx(
+        "rounded-2xl border p-4",
+        "bg-muted/5",
+        "shadow-sm",
+        "transition-all motion-safe:duration-200",
+        "motion-safe:hover:-translate-y-[1px] motion-safe:hover:shadow-md",
+        "hover:bg-muted/10"
+      )}
+    >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <p className="text-xs text-muted-foreground">{props.label}</p>
@@ -444,17 +501,17 @@ function StatTile(props: { icon: ReactNode; label: string; value: string; hint: 
 function Chip(props: { children: ReactNode; subtle?: boolean }) {
   return (
     <span
-      className={[
+      className={cx(
         "text-[11px] px-2 py-0.5 rounded-full border whitespace-nowrap",
-        props.subtle ? "bg-muted/15 text-muted-foreground" : "bg-muted/35 text-muted-foreground",
-      ].join(" ")}
+        props.subtle ? "bg-muted/10 text-muted-foreground" : "bg-muted/25 text-muted-foreground"
+      )}
     >
       {props.children}
     </span>
   );
 }
 
-/* ---------- Help Overlay (centrado + backdrop + scroll + lock) ---------- */
+/* ---------- Help Overlay (clean, not flashy) ---------- */
 
 function HelpOverlay(props: {
   open: boolean;
@@ -495,7 +552,7 @@ function HelpOverlay(props: {
   return (
     <div className="fixed inset-0 z-50">
       <div
-        className="fixed inset-0 bg-black/60 backdrop-blur-[2px]"
+        className="fixed inset-0 bg-black/55 backdrop-blur-[2px]"
         onClick={props.onClose}
         aria-hidden="true"
       />
@@ -508,12 +565,12 @@ function HelpOverlay(props: {
           className="w-full max-w-4xl"
           onClick={(e) => e.stopPropagation()}
         >
-          <Card className="rounded-2xl border bg-card/90 backdrop-blur supports-[backdrop-filter]:bg-card/70 shadow-lg overflow-hidden">
+          <Card className="rounded-2xl border bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/80 shadow-lg overflow-hidden">
             {/* Top bar */}
             <div className="flex flex-wrap items-start justify-between gap-3 p-4 border-b">
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
-                  <span className="inline-flex h-9 w-9 items-center justify-center rounded-xl border bg-muted/30">
+                  <span className="inline-flex h-9 w-9 items-center justify-center rounded-xl border bg-muted/25">
                     {meta.icon}
                   </span>
                   <div className="min-w-0">
@@ -525,13 +582,7 @@ function HelpOverlay(props: {
                 </div>
               </div>
 
-              <Button
-                ref={closeBtnRef}
-                type="button"
-                variant="ghost"
-                onClick={props.onClose}
-                className="gap-2"
-              >
+              <Button ref={closeBtnRef} type="button" variant="ghost" onClick={props.onClose} className="gap-2">
                 <X className="h-4 w-4" />
                 Cerrar
               </Button>
@@ -539,7 +590,7 @@ function HelpOverlay(props: {
 
             {/* Tabs */}
             <div className="px-4">
-              <div className="sticky top-0 z-10 -mx-4 border-b bg-card/90 px-4 py-3 backdrop-blur supports-[backdrop-filter]:bg-card/70">
+              <div className="sticky top-0 z-10 -mx-4 border-b bg-card/95 px-4 py-3 backdrop-blur supports-[backdrop-filter]:bg-card/80">
                 <div className="flex flex-wrap gap-2">
                   <TabBtn cur={props.tab} v="rutalabs" onClick={props.onTab} icon={TAB_META.rutalabs.icon}>
                     RutaLabs
@@ -547,12 +598,7 @@ function HelpOverlay(props: {
                   <TabBtn cur={props.tab} v="pomodoro" onClick={props.onTab} icon={TAB_META.pomodoro.icon}>
                     Pomodoro
                   </TabBtn>
-                  <TabBtn
-                    cur={props.tab}
-                    v="active_recall"
-                    onClick={props.onTab}
-                    icon={TAB_META.active_recall.icon}
-                  >
+                  <TabBtn cur={props.tab} v="active_recall" onClick={props.onTab} icon={TAB_META.active_recall.icon}>
                     Cómo se estudia
                   </TabBtn>
                   <TabBtn cur={props.tab} v="projects" onClick={props.onTab} icon={TAB_META.projects.icon}>
@@ -595,7 +641,7 @@ function TabBtn(props: {
       variant={active ? "default" : "secondary"}
       size="sm"
       onClick={() => props.onClick(props.v)}
-      className="gap-2"
+      className={cx("gap-2 rounded-xl", !active && "hover:bg-muted/25")}
     >
       {props.icon}
       {props.children}
@@ -603,7 +649,7 @@ function TabBtn(props: {
   );
 }
 
-/* ---------- Help content (se mantiene igual) ---------- */
+/* ---------- Help content---------- */
 
 function HelpRutaLabs() {
   return (
@@ -733,7 +779,6 @@ function HelpProjects() {
       <p className="text-sm font-medium">Proyectos y Comunidad</p>
 
       <div className="mt-3 space-y-4 text-sm text-muted-foreground">
-        {/* Qué es */}
         <div>
           <p className="font-medium text-foreground">Qué es un proyecto</p>
           <p className="mt-1">
@@ -746,7 +791,6 @@ function HelpProjects() {
           </p>
         </div>
 
-        {/* Bloques */}
         <div>
           <p className="font-medium text-foreground">Bloques: texto y flashcards</p>
 
@@ -797,7 +841,6 @@ function HelpProjects() {
           </div>
         </div>
 
-        {/* Estudiar */}
         <div>
           <p className="font-medium text-foreground">Estudiar un proyecto</p>
           <ol className="mt-1 list-decimal pl-5 space-y-1">
@@ -808,17 +851,14 @@ function HelpProjects() {
           </ol>
         </div>
 
-        {/* Comunidad */}
         <div>
           <p className="font-medium text-foreground">Comunidad</p>
           <p className="mt-1">
-            Puedes publicar un proyecto para que otras personas lo exploren. Dependiendo de la
-            visibilidad, otros usuarios pueden ver el contenido y, si el sistema lo permite,
-            guardar una copia para adaptarla a su estudio.
+            Puedes publicar un proyecto para que otras personas lo exploren. Dependiendo de la visibilidad,
+            otros usuarios pueden ver el contenido y, si el sistema lo permite, guardar una copia para adaptarla a su estudio.
           </p>
         </div>
 
-        {/* Miembros y roles */}
         <div>
           <p className="font-medium text-foreground">Miembros y roles (permisos)</p>
           <p className="mt-1">
@@ -829,50 +869,36 @@ function HelpProjects() {
           <div className="mt-2 grid gap-2 md:grid-cols-3">
             <div className="rounded-lg border bg-card p-3">
               <p className="text-sm font-medium">Invitado</p>
-              <p className="mt-1 text-sm text-muted-foreground">
-                Puede <b>ver</b> el proyecto, pero <b>no</b> puede editar contenido.
-              </p>
+              <p className="mt-1 text-sm text-muted-foreground">Puede <b>ver</b> el proyecto, pero <b>no</b> puede editar contenido.</p>
             </div>
 
             <div className="rounded-lg border bg-card p-3">
               <p className="text-sm font-medium">Editor</p>
               <p className="mt-1 text-sm text-muted-foreground">
-                Puede <b>editar</b> el contenido del proyecto (bloques de texto, grupos y tarjetas),
-                según lo permitido por el proyecto.
+                Puede <b>editar</b> el contenido del proyecto (bloques de texto, grupos y tarjetas), según lo permitido por el proyecto.
               </p>
             </div>
 
             <div className="rounded-lg border bg-card p-3">
               <p className="text-sm font-medium">Dueño</p>
               <p className="mt-1 text-sm text-muted-foreground">
-                Tiene <b>control total</b>: puede administrar miembros/roles, cambiar visibilidad,
-                y gestionar el proyecto completo.
+                Tiene <b>control total</b>: puede administrar miembros/roles, cambiar visibilidad, y gestionar el proyecto completo.
               </p>
             </div>
           </div>
 
           <p className="mt-2 text-sm text-muted-foreground">
-            Importante: el rol de <b>dueño</b> se puede <b>transferir</b> a otro miembro del proyecto si
-            se necesita (por ejemplo, si el creador original ya no lo administrará).
+            Importante: el rol de <b>dueño</b> se puede <b>transferir</b> a otro miembro del proyecto si se necesita.
           </p>
         </div>
 
-        {/* Acciones */}
         <div>
           <p className="font-medium text-foreground">Acciones comunes</p>
           <ul className="mt-1 list-disc pl-5 space-y-1">
-            <li>
-              <b>Ver</b>: modo lectura para estudiar sin distracciones.
-            </li>
-            <li>
-              <b>Editar</b>: modificar bloques de texto y tarjetas (según tu rol).
-            </li>
-            <li>
-              <b>Miembros</b>: ver y administrar permisos (principalmente el dueño).
-            </li>
-            <li>
-              <b>Eliminar</b>: borrar el proyecto de forma permanente (normalmente solo el dueño).
-            </li>
+            <li><b>Ver</b>: modo lectura para estudiar sin distracciones.</li>
+            <li><b>Editar</b>: modificar bloques de texto y tarjetas (según tu rol).</li>
+            <li><b>Miembros</b>: ver y administrar permisos (principalmente el dueño).</li>
+            <li><b>Eliminar</b>: borrar el proyecto de forma permanente (normalmente solo el dueño).</li>
           </ul>
         </div>
       </div>
