@@ -1,109 +1,105 @@
-<a href="https://demo-nextjs-with-supabase.vercel.app/">
-  <img alt="Next.js and Supabase Starter Kit - the fastest way to build apps with Next.js and Supabase" src="https://demo-nextjs-with-supabase.vercel.app/opengraph-image.png">
-  <h1 align="center">Next.js and Supabase Starter Kit</h1>
-</a>
+# RutaLabs
 
-<p align="center">
- The fastest way to build apps with Next.js and Supabase
-</p>
+Plataforma de estudio basada en proyectos (apuntes + flashcards + agenda de repaso + Pomodoro). Prototipo web desarrollado para mi Proyecto/Examen de Título.
 
-<p align="center">
-  <a href="#features"><strong>Features</strong></a> ·
-  <a href="#demo"><strong>Demo</strong></a> ·
-  <a href="#deploy-to-vercel"><strong>Deploy to Vercel</strong></a> ·
-  <a href="#clone-and-run-locally"><strong>Clone and run locally</strong></a> ·
-  <a href="#feedback-and-issues"><strong>Feedback and issues</strong></a>
-  <a href="#more-supabase-examples"><strong>More Examples</strong></a>
-</p>
-<br/>
+**Demo:** [https://rutalabs.vercel.app/](https://rutalabs.vercel.app/)
 
-## Features
+---
 
-- Works across the entire [Next.js](https://nextjs.org) stack
-  - App Router
-  - Pages Router
-  - Proxy
-  - Client
-  - Server
-  - It just works!
-- supabase-ssr. A package to configure Supabase Auth to use cookies
-- Password-based authentication block installed via the [Supabase UI Library](https://supabase.com/ui/docs/nextjs/password-based-auth)
-- Styling with [Tailwind CSS](https://tailwindcss.com)
-- Components with [shadcn/ui](https://ui.shadcn.com/)
-- Optional deployment with [Supabase Vercel Integration and Vercel deploy](#deploy-your-own)
-  - Environment variables automatically assigned to Vercel project
+## Contenidos
 
-## Demo
+* [Resumen](#resumen)
+* [Características](#características)
+* [Stack](#stack)
+* [Diseño del sistema](#diseño-del-sistema)
+* [Estado](#estado)
 
-You can view a fully working demo at [demo-nextjs-with-supabase.vercel.app](https://demo-nextjs-with-supabase.vercel.app/).
+---
 
-## Deploy to Vercel
+## Resumen
 
-Vercel deployment will guide you through creating a Supabase account and project.
+La unidad principal de RutaLabs es el **proyecto**. Un proyecto concentra el contenido (bloques de texto y conjuntos de tarjetas) y el progreso (agenda y estados de repaso por usuario). La intención es operacional: convertir material de estudio en un flujo continuo con prioridades claras, sin depender de múltiples herramientas desconectadas.
 
-After installation of the Supabase integration, all relevant environment variables will be assigned to the project so the deployment is fully functioning.
+---
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fvercel%2Fnext.js%2Ftree%2Fcanary%2Fexamples%2Fwith-supabase&project-name=nextjs-with-supabase&repository-name=nextjs-with-supabase&demo-title=nextjs-with-supabase&demo-description=This+starter+configures+Supabase+Auth+to+use+cookies%2C+making+the+user%27s+session+available+throughout+the+entire+Next.js+app+-+Client+Components%2C+Server+Components%2C+Route+Handlers%2C+Server+Actions+and+Middleware.&demo-url=https%3A%2F%2Fdemo-nextjs-with-supabase.vercel.app%2F&external-id=https%3A%2F%2Fgithub.com%2Fvercel%2Fnext.js%2Ftree%2Fcanary%2Fexamples%2Fwith-supabase&demo-image=https%3A%2F%2Fdemo-nextjs-with-supabase.vercel.app%2Fopengraph-image.png)
+## Características
 
-The above will also clone the Starter kit to your GitHub, you can clone that locally and develop locally.
+* Proyectos con visibilidad (**privado / no listado / público**) y membresías (**owner / editor / guest**).
+* Bloques de contenido: texto (Markdown) y flashcards organizadas por grupo.
+* Práctica orientada a **active recall** (frente → revelar → calificar) con actualización de estado de repaso.
+* Agenda construida desde vencimientos (con agregaciones resueltas en DB vía RPC).
+* Pomodoro con configuración persistente y registro de sesiones.
+* Publicación/importación de proyectos para biblioteca comunitaria (con control mínimo mediante reportes/moderación).
 
-If you wish to just develop locally and not deploy to Vercel, [follow the steps below](#clone-and-run-locally).
+---
 
-## Clone and run locally
+## Stack
 
-1. You'll first need a Supabase project which can be made [via the Supabase dashboard](https://database.new)
+* Next.js (App Router)
+* TypeScript
+* Supabase (Auth + PostgreSQL + RPC + RLS)
+* TailwindCSS + shadcn/ui
 
-2. Create a Next.js app using the Supabase Starter template npx command
+---
 
-   ```bash
-   npx create-next-app --example with-supabase with-supabase-app
-   ```
+## Diseño del sistema
 
-   ```bash
-   yarn create next-app --example with-supabase with-supabase-app
-   ```
+### Capas
 
-   ```bash
-   pnpm create next-app --example with-supabase with-supabase-app
-   ```
+* **UI / Presentación:** Next.js (rutas públicas y protegidas) + componentes por dominio.
+* **Aplicación:** casos de uso (crear proyecto, editar bloques, practicar, planificar, publicar/importar).
+* **Datos y control:** Postgres (constraints + RLS) + funciones SQL (RPC) para cálculos de agenda.
 
-3. Use `cd` to change into the app's directory
+### Principio clave
 
-   ```bash
-   cd with-supabase-app
-   ```
+El contenido es **compartible**, pero el progreso es **individual**.
 
-4. Rename `.env.example` to `.env.local` and update the following:
+Esto evita mezclar “material” con “estado de aprendizaje” y permite colaboración/importación sin corromper el avance de cada usuario.
 
-  ```env
-  NEXT_PUBLIC_SUPABASE_URL=[INSERT SUPABASE PROJECT URL]
-  NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=[INSERT SUPABASE PROJECT API PUBLISHABLE OR ANON KEY]
-  ```
-  > [!NOTE]
-  > This example uses `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`, which refers to Supabase's new **publishable** key format.
-  > Both legacy **anon** keys and new **publishable** keys can be used with this variable name during the transition period. Supabase's dashboard may show `NEXT_PUBLIC_SUPABASE_ANON_KEY`; its value can be used in this example.
-  > See the [full announcement](https://github.com/orgs/supabase/discussions/29260) for more information.
+<details>
+<summary><strong>Modelo conceptual (resumen)</strong></summary>
 
-  Both `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` can be found in [your Supabase project's API settings](https://supabase.com/dashboard/project/_?showConnect=true)
+* **Proyecto:** contenedor principal de un tema.
+* **Bloque:** unidad modular dentro de un proyecto (texto o flashcards).
+* **Flashcard:** par frente/reverso.
+* **Estado de repaso:** variables mínimas para repetición espaciada por usuario (vencimiento, intervalo, facilidad, etc.).
+* **Sesión Pomodoro:** registro de tiempo de estudio y configuración.
+* **Publicación:** representación exportable del proyecto (idealmente con revisiones/versionado).
+* **Reporte/moderación:** control mínimo sobre contenido público.
 
-5. You can now run the Next.js local development server:
+</details>
 
-   ```bash
-   npm run dev
-   ```
+<details>
+<summary><strong>Base de datos (mapa rápido)</strong></summary>
 
-   The starter kit should now be running on [localhost:3000](http://localhost:3000/).
+| Dominio    | Qué resuelve                            | Tablas típicas                                            |
+| ---------- | --------------------------------------- | --------------------------------------------------------- |
+| Identidad  | perfil mínimo asociado a Auth           | `profiles`                                                |
+| Proyectos  | propiedad, visibilidad, colaboración    | `projects`, `project_members`                             |
+| Contenido  | estructura editable dentro del proyecto | `project_blocks`, `flashcard_groups`, `flashcards`        |
+| Repaso     | progreso individual y trazabilidad      | `flashcard_review_state`, `flashcard_review_log`          |
+| Pomodoro   | configuración y sesiones                | `pomodoro_settings`, `pomodoro_state`, `pomodoro_session` |
+| Comunidad  | publicación/importación/biblioteca      | `published_projects`, revisiones, items de biblioteca     |
+| Moderación | reportes y decisiones                   | `reports`, `moderation_action`                            |
 
-6. This template comes with the default shadcn/ui style initialized. If you instead want other ui.shadcn styles, delete `components.json` and [re-install shadcn/ui](https://ui.shadcn.com/docs/installation/next)
+</details>
 
-> Check out [the docs for Local Development](https://supabase.com/docs/guides/getting-started/local-development) to also run Supabase locally.
+<details>
+<summary><strong>Seguridad y control de acceso</strong></summary>
 
-## Feedback and issues
+* Auth: Supabase Auth.
+* Autorización: RLS/policies + constraints en Postgres (la UI no es la autoridad).
+* Aislamiento: por proyecto y por rol.
+* Trazabilidad: logs para repaso y acciones sensibles (publicación/reportes).
 
-Please file feedback and issues over on the [Supabase GitHub org](https://github.com/supabase/supabase/issues/new/choose).
+</details>
 
-## More Supabase examples
+---
 
-- [Next.js Subscription Payments Starter](https://github.com/vercel/nextjs-subscription-payments)
-- [Cookie-based Auth and the Next.js 13 App Router (free course)](https://youtube.com/playlist?list=PL5S4mPUpp4OtMhpnp93EFSo42iQ40XjbF)
-- [Supabase Auth and the Next.js App Router](https://github.com/supabase/supabase/tree/master/examples/auth/nextjs)
+## Estado
+
+* [x] MVP funcional (proyectos, bloques, flashcards, agenda, Pomodoro)
+* [x] Superficie de comunidad (publicación/importación) + reportes
+* [x] Endurecer políticas de permisos lado DB (RLS/policies)
+* [ ] Refinar el algoritmo de repaso y su UX
+* [ ] Métricas simples por proyecto (tiempo, sesiones, evolución)
